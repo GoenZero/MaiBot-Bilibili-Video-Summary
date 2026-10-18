@@ -39,6 +39,10 @@ class FakeWorld:
         self.video_size = len(VIDEO_BYTES)
         self.media_hits = 0
         self.base = ""
+        self.block_view = 0  # 接下来几次 view 请求返回 HTTP 412
+        self.view_hits = 0
+        self.player_hits = 0
+        self.cookies_seen: List[str] = []
 
     def check_signature(self, request: web.Request) -> None:
         params = dict(request.query)
@@ -50,6 +54,7 @@ class FakeWorld:
     def app(self) -> web.Application:
         app = web.Application()
         app.router.add_get("/x/web-interface/nav", self.nav)
+        app.router.add_get("/x/frontend/finger/spi", self.spi)
         app.router.add_get("/x/web-interface/view", self.view)
         app.router.add_get("/x/player/wbi/playurl", self.playurl)
         app.router.add_get("/x/player/wbi/v2", self.player_v2)
@@ -76,7 +81,15 @@ class FakeWorld:
             }
         )
 
+    async def spi(self, request: web.Request) -> web.Response:
+        return web.json_response({"code": 0, "data": {"b_3": "REAL-BUVID3", "b_4": "REAL-BUVID4"}})
+
     async def view(self, request: web.Request) -> web.Response:
+        self.view_hits += 1
+        self.cookies_seen.append(request.headers.get("Cookie", ""))
+        if self.block_view > 0:
+            self.block_view -= 1
+            return web.Response(status=412, text="blocked")
         if request.query.get("bvid") == "BV1missing00":
             return web.json_response({"code": -404, "message": "啥都木有"})
         pages = [
@@ -125,6 +138,7 @@ class FakeWorld:
         return web.json_response({"code": 0, "data": {}})
 
     async def player_v2(self, request: web.Request) -> web.Response:
+        self.player_hits += 1
         self.check_signature(request)
         # 真实的 B 站给的是「//aisubtitle.hdslb.com/...」（插件会补上 https:）；本地假服务器只有 http，所以给完整地址
         tracks = [{"lan": "ai-zh", "subtitle_url": f"{self.base}/sub.json"}] if self.subtitles else []

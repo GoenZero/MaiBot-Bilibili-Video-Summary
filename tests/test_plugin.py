@@ -150,3 +150,22 @@ def test_status_is_not_stored_and_hides_secrets(tmp_path, monkeypatch):
         await plugin.on_unload()
 
     with_world(monkeypatch, test)
+
+
+def test_tool_reads_a_time_range(tmp_path, monkeypatch):
+    host = FakeHost()
+    plugin = make_plugin(tmp_path, host)
+
+    async def test(world):
+        world.duration = 1200
+        world.subtitles = [{"from": m * 60, "to": m * 60 + 5, "content": f"第{m}分钟"} for m in range(20)]
+        await plugin.on_load()
+        result = await plugin.tool_watch(url=BVID, start="06:30", end="10:50")
+        assert result["success"] is True and "07:00 第7分钟" in result["content"] and "11:00" not in result["content"]
+        only_start = await plugin.tool_watch(url=BVID, start="10分钟")
+        assert "10:00–15:00" in only_start["content"]
+        bad = await plugin.tool_watch(url=BVID, start="半路")
+        assert bad["success"] is False and "格式" in bad["error"]
+        await plugin.on_unload()
+
+    with_world(monkeypatch, test)

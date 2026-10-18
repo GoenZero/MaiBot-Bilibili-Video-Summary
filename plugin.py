@@ -16,7 +16,7 @@ from maibot_sdk import Command, HookHandler, MaiBotPlugin, Tool
 from maibot_sdk.types import ErrorPolicy, HookMode, ToolParameterInfo, ToolParamType
 
 from .config import PLUGIN_VERSION, BilibiliVideoConfig
-from .core.bilibili import BiliClient, BiliError
+from .core.bilibili import BiliClient, BiliError, parse_time
 from .core.cache import ResultCache
 from .core.links import find_links
 from .core.qwen import QwenClient, QwenSettings
@@ -27,7 +27,8 @@ WATCH_DESCRIPTION = (
     "看一个 B 站视频，拿到视频的内容描述（短视频会看画面和声音，长视频读字幕），以及标题、UP 主、简介和热门弹幕。"
     "对方发来 B 站链接（包括 b23.tv 短链接或 BV 号）、想让你看看，或者你好奇视频内容时用。"
     "B 站链接请用这个工具，不必再用网页抓取工具去抓 B 站页面。"
-    "看完像自己看过一样自然地聊，不要逐条复述描述，也不要提到工具。"
+    "只想看其中一段时，填 start 和 end（例如 06:30 和 10:50），会给你这段时间的字幕原文；这只能读字幕，看不到这段的画面。"
+    "看完像自己看过一样自然地聊，不要逐条复述描述，也不要提到工具。没看成就如实告诉对方原因，不要让对方替你去看。"
 )
 # 一条消息里最多预取几个链接
 PREFETCH_PER_MESSAGE = 2
@@ -168,19 +169,33 @@ class BilibiliVideoPlugin(MaiBotPlugin):
         description=WATCH_DESCRIPTION,
         parameters=[
             ToolParameterInfo(name="url", param_type=ToolParamType.STRING, description="B 站视频链接、b23.tv 短链接或 BV 号"),
+            ToolParameterInfo(
+                name="start", param_type=ToolParamType.STRING, description="只看一段时：开始时间，例如 06:30；看整个视频时不填", required=False
+            ),
+            ToolParameterInfo(
+                name="end", param_type=ToolParamType.STRING, description="只看一段时：结束时间，例如 10:50；不填就看到开始时间之后 5 分钟", required=False
+            ),
         ],
         timeout_ms=600_000,
     )
-    async def tool_watch(self, url: str = "", **kwargs: Any) -> Dict[str, Any]:
+    async def tool_watch(self, url: str = "", start: str = "", end: str = "", **kwargs: Any) -> Dict[str, Any]:
         del kwargs
         watcher = self._watcher
         if watcher is None or not self.config.plugin.enabled:
             return {"success": False, "error": "看视频的功能现在关着"}
         links = find_links(str(url or "")) or [str(url or "").strip()]
+        segment: Optional[tuple[int, int]] = None
+        if str(start or "").strip() or str(end or "").strip():
+            begin = parse_time(start) if str(start or "").strip() else 0
+            finish = parse_time(end) if str(end or "").strip() else (begin + 300 if begin is not None else None)
+            if begin is None or finish is None:
+                return {"success": False, "error": "start / end 的时间格式认不出，请写成 06:30 这样"}
+            segment = (begin, finish)
         try:
-            content = await watcher.watch(links[0])
+            content = await (watcher.segment(links[0], *segment) if segment else watcher.watch(links[0]))
         except BiliError as exc:
             self._last_error = str(exc)
+            self.ctx.logger.warning("B站视频：没看成（%s）：%s %s", links[0], exc, exc.detail)
             return {"success": False, "error": f"这个视频没看成：{exc}"}
         except Exception as exc:  # noqa: BLE001 - 任何意外都如实告诉 AI，而不是让工具调用报错
             self.ctx.logger.exception("B站视频：看视频时出错")
@@ -212,7 +227,9 @@ class BilibiliVideoPlugin(MaiBotPlugin):
             lines.append("B 站登录：未填写（读不到 AI 字幕）")
         lines.append(f"看画面的模型：{cfg.qwen.model}（{'北京' if cfg.qwen.region == 'beijing' else '新加坡'}）" if cfg.qwen.api_key.strip() else "看画面的模型：未填写百炼 API Key（只读字幕和简介）")
         lines.append(f"看画面的时长上限：{cfg.watch.short_minutes} 分钟")
-        lines.append(f"已缓存：{len(self._cache) if self._cache else 0} 个视频")
+        lines.append(f"已缓存：{len(self._cache) if self._cache else 0} 条")
+        if watcher is not None and watcher.bili.blocked_seconds:
+            lines.append(f"⚠️ 刚被 B 站风控拦过，{watcher.bili.blocked_seconds} 秒内暂停请求")
         if self._last_error:
             lines.append(f"最近一次失败：{self._last_error}")
         return "\n".join(lines)

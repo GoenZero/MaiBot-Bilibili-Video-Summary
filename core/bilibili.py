@@ -48,7 +48,16 @@ _ERRORS = {
 
 
 class BiliError(Exception):
-    """给人和 AI 看的错误说明。"""
+    """给人和 AI 看的错误说明；detail 只写进日志（哪个接口、什么状态），帮助排查。"""
+
+    def __init__(self, message: str, detail: str = "") -> None:
+        super().__init__(message)
+        self.detail = detail
+
+
+# 被 B 站风控（HTTP 412）拦下后：等一会重试一次；还不行就暂停一段时间，不再接连请求，免得越拦越久
+BLOCK_RETRY_DELAY = 3.0
+BLOCK_COOLDOWN = 120.0
 
 
 @dataclass
@@ -146,6 +155,34 @@ def _fingerprint_params() -> Dict[str, str]:
     }
 
 
+_TIME_COLON = re.compile(r"^\s*(?:(\d{1,2}):)?(\d{1,3}):(\d{1,2})\s*$")
+_TIME_CN = re.compile(r"^\s*(?:(\d+)\s*(?:小时|时))?\s*(?:(\d+)\s*分(?:钟)?)?\s*(?:(\d+)\s*秒)?\s*$")
+
+
+def parse_time(text: str) -> Optional[int]:
+    """「06:30」「1:02:30」「390」「6分30秒」→ 秒数；认不出返回 None。"""
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+    if raw.isdigit():
+        return int(raw)
+    match = _TIME_COLON.match(raw)
+    if match:
+        hours, minutes, seconds = (int(x) if x else 0 for x in match.groups())
+        return hours * 3600 + minutes * 60 + seconds
+    match = _TIME_CN.match(raw)
+    if match and any(match.groups()):
+        hours, minutes, seconds = (int(x) if x else 0 for x in match.groups())
+        return hours * 3600 + minutes * 60 + seconds
+    return None
+
+
+def line_seconds(line: str) -> Optional[int]:
+    """字幕行「06:30 内容」开头的时间。"""
+    head = line.split(" ", 1)[0]
+    return parse_time(head) if ":" in head else None
+
+
 def format_seconds(seconds: float) -> str:
     seconds = int(seconds)
     if seconds >= 3600:
@@ -162,10 +199,12 @@ class BiliClient:
     def __init__(self, session: aiohttp.ClientSession, cookie: str = "") -> None:
         self._session = session
         self._cookies = parse_cookie(cookie)
-        self._cookies.setdefault("buvid3", f"{uuid.uuid4()}infoc")
-        self._cookies.setdefault("b_nut", str(int(time.time())))
+        # 没有设备标识（buvid3）的请求更容易被风控；用户粘的 Cookie 里一般有，没有就向 B 站要一个
+        self._device_ready = "buvid3" in self._cookies
+        self._device_lock = asyncio.Lock()
         self._wbi: Tuple[str, float] = ("", 0.0)
         self._wbi_lock = asyncio.Lock()
+        self._blocked_until = 0.0
 
     @property
     def has_login_cookie(self) -> bool:
@@ -180,31 +219,72 @@ class BiliClient:
             "Cookie": "; ".join(f"{k}={v}" for k, v in self._cookies.items()),
         }
 
+    @property
+    def blocked_seconds(self) -> int:
+        """还要暂停多少秒（被风控拦下后）。"""
+        return max(0, int(self._blocked_until - time.monotonic()))
+
+    async def _ensure_device(self) -> None:
+        if self._device_ready:
+            return
+        async with self._device_lock:
+            if self._device_ready:
+                return
+            self._device_ready = True
+            try:
+                async with self._session.get(
+                    f"{self.API}/x/frontend/finger/spi", headers={"User-Agent": USER_AGENT}, timeout=aiohttp.ClientTimeout(total=10)
+                ) as response:
+                    payload = await response.json(content_type=None)
+                data = payload.get("data") if isinstance(payload, dict) and isinstance(payload.get("data"), dict) else {}
+                if data.get("b_3"):
+                    self._cookies["buvid3"] = str(data["b_3"])
+                if data.get("b_4"):
+                    self._cookies["buvid4"] = str(data["b_4"])
+            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+                pass
+            self._cookies.setdefault("buvid3", f"{uuid.uuid4()}infoc")
+            self._cookies.setdefault("b_nut", str(int(time.time())))
+
     async def _json(self, url: str, params: Optional[Dict[str, Any]] = None, *, referer: str = "https://www.bilibili.com/", timeout: float = 15) -> Dict[str, Any]:
-        try:
-            async with self._session.get(
-                url, params=params, headers=self._headers(referer), timeout=aiohttp.ClientTimeout(total=timeout)
-            ) as response:
-                if response.status == 412:
-                    raise BiliError(_ERRORS[-412])
-                if response.status >= 400:
-                    raise BiliError(f"B 站返回 HTTP {response.status}")
-                payload = await response.json(content_type=None)
-        except asyncio.TimeoutError as exc:
-            raise BiliError("连接 B 站超时") from exc
-        except aiohttp.ClientError as exc:
-            raise BiliError(f"连接 B 站失败（{type(exc).__name__}）") from exc
-        except ValueError as exc:
-            raise BiliError("B 站返回的内容看不懂") from exc
-        if not isinstance(payload, dict):
-            raise BiliError("B 站返回的内容看不懂")
-        return payload
+        where = urlparse(url).path or url
+        if self.blocked_seconds:
+            raise BiliError(f"刚被 B 站风控拦过，{self.blocked_seconds} 秒后再试", f"{where} 暂停中")
+        await self._ensure_device()
+        for attempt in (1, 2):
+            try:
+                async with self._session.get(
+                    url, params=params, headers=self._headers(referer), timeout=aiohttp.ClientTimeout(total=timeout)
+                ) as response:
+                    status = response.status
+                    if status == 412:
+                        if attempt == 1:
+                            await asyncio.sleep(BLOCK_RETRY_DELAY)
+                            continue
+                        self._blocked_until = time.monotonic() + BLOCK_COOLDOWN
+                        raise BiliError(_ERRORS[-412], f"{where} HTTP 412（重试后仍被拦）")
+                    if status >= 400:
+                        raise BiliError(f"B 站返回 HTTP {status}", f"{where} HTTP {status}")
+                    payload = await response.json(content_type=None)
+            except asyncio.TimeoutError as exc:
+                raise BiliError("连接 B 站超时", f"{where} 超时") from exc
+            except aiohttp.ClientError as exc:
+                raise BiliError(f"连接 B 站失败（{type(exc).__name__}）", f"{where} {type(exc).__name__}") from exc
+            except ValueError as exc:
+                raise BiliError("B 站返回的内容看不懂", f"{where} 不是 JSON") from exc
+            if not isinstance(payload, dict):
+                raise BiliError("B 站返回的内容看不懂", f"{where} 不是 JSON 对象")
+            if payload.get("code") in (-352, -412):
+                self._blocked_until = time.monotonic() + BLOCK_COOLDOWN
+            return payload
+        raise BiliError(_ERRORS[-412], where)  # 走不到这里
 
     @staticmethod
     def _data(payload: Dict[str, Any], *, allow: Tuple[int, ...] = ()) -> Dict[str, Any]:
         code = payload.get("code", 0)
         if code != 0 and code not in allow:
-            raise BiliError(_ERRORS.get(code, f"B 站返回错误 {code}：{str(payload.get('message', ''))[:60]}"))
+            message = _ERRORS.get(code, f"B 站返回错误 {code}：{str(payload.get('message', ''))[:60]}")
+            raise BiliError(message, f"code={code} message={str(payload.get('message', ''))[:60]}")
         data = payload.get("data")
         return data if isinstance(data, dict) else {}
 

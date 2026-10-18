@@ -10,7 +10,7 @@ import pytest
 
 from bili_video_under_test.core import bilibili as bili_module
 from bili_video_under_test.core import qwen as qwen_module
-from bili_video_under_test.core.bilibili import BiliClient, BiliError, mixin_key, parse_cookie, sign_wbi
+from bili_video_under_test.core.bilibili import BiliClient, BiliError, line_seconds, mixin_key, parse_cookie, parse_time, sign_wbi
 from bili_video_under_test.core.cache import ResultCache
 from bili_video_under_test.core.links import VideoRef, find_links, parse_video_url, ref_from_text
 from bili_video_under_test.core.qwen import QwenClient, QwenError, QwenSettings
@@ -260,5 +260,71 @@ def test_oversized_video_is_not_downloaded(tmp_path, monkeypatch):
         watcher = make_watcher(world, session, monkeypatch, tmp_path, max_mb=1)
         text = await watcher.watch(BVID)
         assert "视频文件太大" in text and world.media_hits == 0
+
+    run_with_world(test)
+
+
+def test_parse_time_formats():
+    assert parse_time("06:30") == 390 and parse_time("6:30") == 390 and parse_time("1:02:30") == 3750
+    assert parse_time("390") == 390 and parse_time("6分30秒") == 390 and parse_time("10分钟") == 600
+    assert parse_time("1小时2分") == 3720
+    assert parse_time("") is None and parse_time("半路") is None and parse_time("6:3x") is None
+    assert line_seconds("06:30 内容") == 390 and line_seconds("没有时间的行") is None
+
+
+def test_blocked_request_retries_once_then_pauses(monkeypatch):
+    monkeypatch.setattr(bili_module, "BLOCK_RETRY_DELAY", 0.01)
+
+    async def test(world, session):
+        client = client_for(world, session)
+        world.block_view = 1  # 第一次被拦，重试成功
+        assert (await client.view(VideoRef(bvid=BVID))).cid == 170002
+        assert world.view_hits == 2
+        # 自动向 B 站要了设备标识
+        assert "buvid3=REAL-BUVID3" in world.cookies_seen[-1] and "buvid4=REAL-BUVID4" in world.cookies_seen[-1]
+
+        world.block_view = 5  # 一直被拦：重试一次后暂停，之后不再请求
+        with pytest.raises(BiliError, match="请求太频繁") as info:
+            await client.view(VideoRef(bvid=BVID))
+        assert "412" in info.value.detail
+        hits = world.view_hits
+        with pytest.raises(BiliError, match="秒后再试"):
+            await client.view(VideoRef(bvid=BVID))
+        assert world.view_hits == hits and client.blocked_seconds > 0
+
+    run_with_world(test)
+
+
+def test_user_cookie_device_id_is_kept():
+    async def test(world, session):
+        client = client_for(world, session, cookie="SESSDATA=s; buvid3=MINE")
+        await client.view(VideoRef(bvid=BVID))
+        assert "buvid3=MINE" in world.cookies_seen[-1] and "REAL-BUVID3" not in world.cookies_seen[-1]
+
+    run_with_world(test)
+
+
+def test_segment_returns_only_that_time_range(tmp_path, monkeypatch):
+    async def test(world, session):
+        world.duration = 1200
+        world.subtitles = [{"from": m * 60, "to": m * 60 + 5, "content": f"第{m}分钟的话"} for m in range(20)]
+        watcher = make_watcher(world, session, monkeypatch, tmp_path)
+        text = await watcher.segment(BVID, 390, 650)
+        assert "06:30–10:50 这一段的字幕" in text
+        assert "07:00 第7分钟的话" in text and "10:00 第10分钟的话" in text
+        assert "06:00" not in text and "11:00" not in text
+        # 第二次问别的段落：字幕已缓存，不再向 B 站要
+        hits = world.player_hits
+        text = await watcher.segment(BVID, 0, 120)
+        assert "00:00 第0分钟的话" in text and "01:00 第1分钟的话" in text
+        assert world.player_hits == hits
+        with pytest.raises(BiliError, match="没有字幕"):
+            await watcher.segment(BVID, 1190, 1300)  # 结束时间超过视频长度会被截到结尾
+        with pytest.raises(BiliError, match="时间段不对"):
+            await watcher.segment(BVID, 1500, 1600)
+        world.subtitles = []
+        watcher2 = make_watcher(world, session, monkeypatch, tmp_path / "w2")
+        with pytest.raises(BiliError, match="没法单独看某一段"):
+            await watcher2.segment(BVID, 0, 60)
 
     run_with_world(test)

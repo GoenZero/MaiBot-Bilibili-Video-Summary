@@ -18,7 +18,7 @@ import logging
 import shutil
 import tempfile
 
-from .bilibili import BiliClient, BiliError, Chapter, VideoInfo, format_chapters, format_seconds
+from .bilibili import BiliClient, BiliError, Chapter, VideoInfo, format_chapters, format_seconds, line_seconds
 from .links import VideoRef
 from .cache import ResultCache
 from .qwen import QwenClient, QwenError, build_video_prompt
@@ -79,7 +79,15 @@ class Watcher:
     def prefetch(self, link: str) -> None:
         """收到链接时先在后台看起来；出错只记日志。"""
         task = asyncio.ensure_future(self.watch(link))
-        task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
+
+        def done(t: "asyncio.Future[str]") -> None:
+            if t.cancelled():
+                return
+            exc = t.exception()
+            if exc is not None:
+                self.log.warning("B站视频：后台预看没成功（%s）：%s %s", link, exc, getattr(exc, "detail", ""))
+
+        task.add_done_callback(done)
 
     async def _work(self, link: str) -> str:
         ref = await self.bili.resolve(link)
@@ -93,6 +101,52 @@ class Watcher:
             task.add_done_callback(lambda _t, k=ref.key: self._by_video.pop(k, None))
         return await asyncio.shield(task)
 
+    async def segment(self, link: str, start: int, end: int) -> str:
+        """只读某一段时间的字幕（原文，太长才压缩）。读不到时抛 BiliError，说明原因。"""
+        ref = await self.bili.resolve(link)
+        info = await self.bili.view(ref)
+        end = min(end, info.duration) if info.duration else end
+        if start >= end:
+            raise BiliError(f"时间段不对：视频总长 {format_seconds(info.duration)}")
+        subtitles = await self._full_subtitles(ref, info)
+        if not subtitles:
+            hint = "" if self.bili.has_login_cookie else "（B 站的 AI 字幕需要在插件里填登录 Cookie）"
+            raise BiliError(f"这个视频没有可用的字幕，没法单独看某一段{hint}")
+        lines = []
+        for line in subtitles.splitlines():
+            at = line_seconds(line)
+            if at is not None and start <= at < end:
+                lines.append(line)
+        span = f"{format_seconds(start)}–{format_seconds(end)}"
+        if not lines:
+            raise BiliError(f"{span} 这段没有字幕（视频总长 {format_seconds(info.duration)}）")
+        body = "\n".join(lines)
+        limit = int(self.settings.max_chars * 0.85)
+        note = ""
+        if len(body) > limit:
+            summary = ""
+            if self.summarize is not None:
+                try:
+                    summary = (await self.summarize(body, limit, "")).strip()
+                except Exception as exc:  # noqa: BLE001
+                    self.log.warning("B站视频：字幕压缩失败：%s", exc)
+            if summary:
+                body, note = summary, "（这段字幕太长，下面是按时间压缩后的内容）"
+            else:
+                body, note = body[:limit], "（这段字幕太长，只保留了开头部分）"
+        return f"【B站视频】《{info.title}》{span} 这一段的字幕{note}，行首是视频里的时间：\n{body}"
+
+    async def _full_subtitles(self, ref: VideoRef, info: VideoInfo) -> str:
+        """完整字幕，读过就缓存，追问别的段落时不用再向 B 站要。"""
+        key = f"{ref.key}:subtitles"
+        cached = self.cache.get(key)
+        if cached is not None:
+            return cached
+        subtitles, _ = await self.bili.subtitles(info)
+        if subtitles:
+            self.cache.put(key, subtitles)
+        return subtitles
+
     async def _watch_ref(self, ref: VideoRef) -> str:
         info = await self.bili.view(ref)
         notes: List[str] = []
@@ -103,7 +157,7 @@ class Watcher:
             try:
                 video_text = await self._watch_video(info)
             except (BiliError, QwenError) as exc:
-                self.log.warning("B站视频：没能看画面（%s）：%s", info.bvid, exc)
+                self.log.warning("B站视频：没能看画面（%s）：%s %s", info.bvid, exc, getattr(exc, "detail", ""))
                 notes.append(f"这次没能看到画面：{exc}")
         elif self.qwen is None:
             notes.append("没有配置看视频的模型，只读了字幕和简介")
@@ -112,7 +166,7 @@ class Watcher:
 
         subtitle_text, chapters = "", []
         if video_text is None:
-            subtitle_text, chapters = await self._subtitle_text(info, notes)
+            subtitle_text, chapters = await self._subtitle_text(ref, info, notes)
 
         text = compose(info, video_text, subtitle_text, danmaku, notes, self.settings.max_chars, chapters)
         if video_text or subtitle_text:
@@ -148,13 +202,16 @@ class Watcher:
         if audio is not None:
             await self.bili.download(audio_url, audio, referer=referer, max_bytes=max(1, budget - used))
 
-    async def _subtitle_text(self, info: VideoInfo, notes: List[str]) -> tuple[str, List[Chapter]]:
-        """字幕（短的原样、长的压缩，都带时间）和 UP 主标的分段。"""
+    async def _subtitle_text(self, ref: VideoRef, info: VideoInfo, notes: List[str]) -> tuple[str, List[Chapter]]:
+        """字幕（短的原样、长的压缩，都带时间）和 UP 主标的分段。完整字幕另外缓存，供只看某一段时用。"""
         try:
             subtitles, chapters = await self.bili.subtitles(info)
         except BiliError as exc:
+            self.log.warning("B站视频：字幕没拿到（%s）：%s %s", info.bvid, exc, exc.detail)
             notes.append(f"字幕没拿到：{exc}")
             return "", []
+        if subtitles:
+            self.cache.put(f"{ref.key}:subtitles", subtitles)
         if not subtitles:
             hint = "" if self.bili.has_login_cookie else "（B 站的 AI 字幕需要在插件里填登录 Cookie）"
             notes.append(f"这个视频没有可用的字幕{hint}")
