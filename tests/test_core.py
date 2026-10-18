@@ -543,7 +543,7 @@ def test_inline_request_reports_send_time_and_blames_the_right_step(tmp_path, mo
         video = tmp_path / "v.mp4"
         video.write_bytes(b"\x01" * 1_500_000)
         assert "猫" in await qwen.describe(video, "描述")
-        assert qwen.last_upload.startswith("直接发送 1.9MB 用了")
+        assert qwen.last_upload.startswith("直接发送 1.9MB 用了不到 1 秒")
 
         world.qwen_delay = 2
         qwen.settings.upload_timeout = 0.3

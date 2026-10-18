@@ -37,10 +37,11 @@ python -m pytest tests          # 本地假的 B 站、百炼、Gemini 服务器
 
 - B 站这边已经稳定：视频信息接口常被风控（HTTP 412）拦下，会自动改从网页读；下载 8MB 只要一两秒。
 - **卡住的问题**：从日本往北京的百炼发视频极慢。真机实测 11.2MB 的请求 10 分钟只发出 8MB（每秒十几 KB）；传到百炼临时空间（OSS）同样慢。这不是代码问题，是线路问题。
-- 为此加了 **Gemini** 作为可选的看视频模型（WebUI「看视频的模型 → 用哪家的模型」选 Gemini，再在「Gemini」分组里填 Key）。**还没在真机上测过**，下一步就是测它：
-  - 期望日志：「下载完成」→「视频已发给Gemini，直接发送 xxMB 用了 x 秒」→「看完了（BVxxx，看了画面）」。
-  - Gemini 的模型名默认 `gemini-3.5-flash`；如果报「模型不存在」之类的错，让用户在 AI Studio 里看可用的模型名，在 WebUI 里改。
-  - 接口格式是按 Gemini REST API（`v1beta/models/{model}:generateContent`，`inlineData`/`fileData`，`videoMetadata.fps`，`generationConfig.mediaResolution`，Files API 可续传上传）写的，开发时查不到最新官方文档，真机报错就按错误信息对照官方文档修。
+- 为此加了 **Gemini** 作为可选的看视频模型（WebUI「看视频的模型 → 用哪家的模型」选 Gemini，再在「Gemini」分组里填 Key）。
+  **真机已验证**（2026-10-18）：4 分钟左右的视频（8.5MB）直接放进请求，发送不到 1 秒，Gemini 约 30 秒看完。用户现在用的就是 Gemini。
+  - 正常的日志：「下载完成」→「视频已发给Gemini，直接发送 xxMB 用了 x 秒」→「看完了（BVxxx，看了画面）」。
+  - 还没在真机上走过的路径：超过约 15MB 的视频走 Gemini 文件接口（Files API）上传；分开的画面和声音交给 Gemini。
+  - 下一步：用户日常用几天，没问题再合并到 `main`。
 - 另一个办法是用户换国际版（新加坡）的百炼 Key，插件已支持（「百炼地域」选新加坡）。
 
 ## 同一个用户的另外两个仓库
