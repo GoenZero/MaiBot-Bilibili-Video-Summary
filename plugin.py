@@ -80,8 +80,13 @@ class BilibiliVideoPlugin(MaiBotPlugin):
     async def _build(self) -> None:
         cfg = self.config
         # trust_env：沿用 MaiBot 容器里设置的 HTTP(S)_PROXY
-        self._session = aiohttp.ClientSession(trust_env=True, timeout=aiohttp.ClientTimeout(total=None, sock_connect=20, sock_read=60))
-        bili = BiliClient(self._session, cfg.bilibili.cookie)
+        # 不用会话自带的 Cookie 罐：B 站的 Cookie 只按插件里填的发，「不带登录信息再试」时才能真的不带
+        self._session = aiohttp.ClientSession(
+            trust_env=True,
+            cookie_jar=aiohttp.DummyCookieJar(),
+            timeout=aiohttp.ClientTimeout(total=None, sock_connect=20, sock_read=60),
+        )
+        bili = BiliClient(self._session, cfg.bilibili.cookie, logger=self.ctx.logger)
         qwen = None
         if cfg.qwen.api_key.strip():
             qwen = QwenClient(

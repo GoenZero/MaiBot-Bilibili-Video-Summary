@@ -42,6 +42,10 @@ class FakeWorld:
         self.media_hits = 0
         self.base = ""
         self.block_view = 0  # 接下来几次 view 请求返回 HTTP 412
+        self.block_logged_in = False  # 带 SESSDATA 的请求都被拦
+        self.block_playurl = False
+        self.block_page = False
+        self.page_hits = 0
         self.view_hits = 0
         self.player_hits = 0
         self.cookies_seen: List[str] = []
@@ -65,6 +69,7 @@ class FakeWorld:
         app.router.add_get("/media/v.mp4", self.media)
         app.router.add_get("/media/a.m4a", self.media)
         app.router.add_get("/short/{code}", self.short)
+        app.router.add_get("/video/{ident}", self.video_page)
         app.router.add_get("/api/v1/uploads", self.upload_policy)
         app.router.add_post("/compatible-mode/v1/chat/completions", self.chat)
         return app
@@ -88,7 +93,10 @@ class FakeWorld:
 
     async def view(self, request: web.Request) -> web.Response:
         self.view_hits += 1
-        self.cookies_seen.append(request.headers.get("Cookie", ""))
+        cookie = request.headers.get("Cookie", "")
+        self.cookies_seen.append(cookie)
+        if self.block_logged_in and "SESSDATA" in cookie:
+            return web.Response(status=412, text="blocked")
         if self.block_view > 0:
             self.block_view -= 1
             return web.Response(status=412, text="blocked")
@@ -116,6 +124,8 @@ class FakeWorld:
 
     async def playurl(self, request: web.Request) -> web.Response:
         self.check_signature(request)
+        if self.block_playurl:
+            return web.Response(status=412, text="blocked")
         if self.playurl_mode == "durl" and request.query.get("fnval") == "1":
             return web.json_response({"code": 0, "data": {"durl": [{"url": f"{self.base}/media/v.mp4", "size": self.video_size}]}})
         if self.playurl_mode == "dash" and request.query.get("fnval") == "4048":
@@ -160,6 +170,32 @@ class FakeWorld:
         if request.headers.get("Referer", "").find("bilibili.com") < 0:
             return web.Response(status=403)
         return web.Response(body=VIDEO_BYTES if self.video_size == len(VIDEO_BYTES) else b"x" * self.video_size)
+
+    async def video_page(self, request: web.Request) -> web.Response:
+        """视频网页：里面嵌着视频信息（__INITIAL_STATE__）和播放地址（__playinfo__）。"""
+        self.page_hits += 1
+        if self.block_page:
+            return web.Response(status=412, text="blocked")
+        video_data = {
+            "bvid": BVID,
+            "aid": 170001,
+            "title": "猫猫跳桌子",
+            "desc": "我家猫今天又整活了",
+            "tname": "动物圈",
+            "owner": {"name": "养猫的人"},
+            "duration": self.duration,
+            "pages": [{"cid": 170002, "part": "正片", "duration": self.duration}],
+        }
+        state = {"videoData": video_data, "p": 1}
+        play = {"code": 0, "data": {"durl": [{"url": f"{self.base}/media/v.mp4", "size": self.video_size}]}}
+        html = (
+            "<html><head><script>window.__playinfo__="
+            + json.dumps(play)
+            + "</script></head><body><script>window.__INITIAL_STATE__="
+            + json.dumps(state, ensure_ascii=False)
+            + ";(function(){var s;}());</script></body></html>"
+        )
+        return web.Response(text=html, content_type="text/html")
 
     async def short(self, request: web.Request) -> web.Response:
         return web.Response(status=302, headers={"Location": f"https://www.bilibili.com/video/{BVID}?p=2&share_source=copy"})

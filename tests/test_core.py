@@ -272,25 +272,49 @@ def test_parse_time_formats():
     assert line_seconds("06:30 内容") == 390 and line_seconds("没有时间的行") is None
 
 
-def test_blocked_request_retries_once_then_pauses(monkeypatch):
-    monkeypatch.setattr(bili_module, "BLOCK_RETRY_DELAY", 0.01)
-
+def test_blocked_view_falls_back_to_the_video_page():
     async def test(world, session):
         client = client_for(world, session)
-        world.block_view = 1  # 第一次被拦，重试成功
-        assert (await client.view(VideoRef(bvid=BVID))).cid == 170002
-        assert world.view_hits == 2
+        client.WWW = world.base
+        world.block_view = 99
+        info = await client.view(VideoRef(bvid=BVID))
+        assert (info.cid, info.title, info.owner) == (170002, "猫猫跳桌子", "养猫的人")
+        assert world.view_hits == 1 and world.page_hits == 1
         # 自动向 B 站要了设备标识
         assert "buvid3=REAL-BUVID3" in world.cookies_seen[-1] and "buvid4=REAL-BUVID4" in world.cookies_seen[-1]
+        # 接口暂停中：不再请求接口，直接走网页
+        assert (await client.view(VideoRef(bvid=BVID))).cid == 170002
+        assert world.view_hits == 1 and world.page_hits == 2 and client.blocked_seconds > 0
 
-        world.block_view = 5  # 一直被拦：重试一次后暂停，之后不再请求
-        with pytest.raises(BiliError, match="请求太频繁") as info:
+        # 接口和网页都被拦：如实报错，日志里写清楚两条路都失败了
+        world.block_page = True
+        with pytest.raises(BiliError, match="请求太频繁|秒后再试") as info:
             await client.view(VideoRef(bvid=BVID))
-        assert "412" in info.value.detail
-        hits = world.view_hits
-        with pytest.raises(BiliError, match="秒后再试"):
-            await client.view(VideoRef(bvid=BVID))
-        assert world.view_hits == hits and client.blocked_seconds > 0
+        assert "网页后备也失败" in info.value.detail
+
+    run_with_world(test)
+
+
+def test_blocked_with_login_retries_without_login():
+    async def test(world, session):
+        client = client_for(world, session, cookie="SESSDATA=secret; bili_jct=j; buvid3=MINE")
+        world.block_logged_in = True
+        info = await client.view(VideoRef(bvid=BVID))
+        assert info.cid == 170002 and world.page_hits == 0
+        assert "SESSDATA" not in world.cookies_seen[-1] and "bili_jct" not in world.cookies_seen[-1]
+        assert "buvid3=MINE" in world.cookies_seen[-1]  # 设备标识照样带着
+
+    run_with_world(test)
+
+
+def test_blocked_playurl_falls_back_to_the_video_page():
+    async def test(world, session):
+        client = client_for(world, session)
+        client.WWW = world.base
+        info = await client.view(VideoRef(bvid=BVID))
+        world.block_playurl = True
+        plan = await client.media_plan(info, 16)
+        assert plan.video_url.endswith("/media/v.mp4") and world.page_hits == 1
 
     run_with_world(test)
 
@@ -354,3 +378,15 @@ def test_slow_model_is_not_cut_off_by_the_session_read_limit(tmp_path, monkeypat
             await server.close()
 
     asyncio.run(main())
+
+
+def test_short_video_still_watched_when_api_is_blocked(tmp_path, monkeypatch):
+    async def test(world, session):
+        watcher = make_watcher(world, session, monkeypatch, tmp_path)
+        watcher.bili.WWW = world.base
+        world.block_view = 99
+        world.block_playurl = True
+        text = await watcher.watch(BVID)
+        assert "笑点是它摔了下来" in text and world.page_hits == 2  # 视频信息、播放地址都从网页拿到
+
+    run_with_world(test)

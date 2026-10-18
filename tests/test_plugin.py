@@ -57,6 +57,7 @@ def with_world(monkeypatch, test):
         server = await start(world)
         monkeypatch.setattr(BiliClient, "API", world.base)
         monkeypatch.setattr(BiliClient, "COMMENT", world.base)
+        monkeypatch.setattr(BiliClient, "WWW", world.base)
         monkeypatch.setitem(qwen_module.REGIONS, "beijing", world.base)
         try:
             await test(world)

@@ -16,6 +16,7 @@ import base64
 import hashlib
 import html
 import json
+import logging
 import random
 import re
 import string
@@ -48,16 +49,21 @@ _ERRORS = {
 
 
 class BiliError(Exception):
-    """给人和 AI 看的错误说明；detail 只写进日志（哪个接口、什么状态），帮助排查。"""
+    """给人和 AI 看的错误说明；detail 只写进日志（哪个接口、什么状态），帮助排查。
+    blocked 表示是被风控拦下的（可以换条路再试）。"""
 
-    def __init__(self, message: str, detail: str = "") -> None:
+    def __init__(self, message: str, detail: str = "", *, blocked: bool = False) -> None:
         super().__init__(message)
         self.detail = detail
+        self.blocked = blocked
 
 
-# 被 B 站风控（HTTP 412）拦下后：等一会重试一次；还不行就暂停一段时间，不再接连请求，免得越拦越久
-BLOCK_RETRY_DELAY = 3.0
-BLOCK_COOLDOWN = 120.0
+# 被 B 站风控（HTTP 412）拦下后，这个接口地址暂停一段时间，不再接连请求，免得越拦越久；网页那条路不受影响
+BLOCK_COOLDOWN = 60.0
+# 换成「不带登录信息」再试时去掉的 Cookie（读视频信息、播放地址都不需要登录）
+_LOGIN_COOKIES = {"SESSDATA", "bili_jct", "DedeUserID", "DedeUserID__ckMd5", "sid"}
+_INITIAL_STATE = re.compile(r"window\.__INITIAL_STATE__\s*=\s*(\{.*?\})\s*;\s*\(function", re.S)
+_PLAYINFO = re.compile(r"window\.__playinfo__\s*=\s*(\{.*?\})\s*</script>", re.S)
 
 
 @dataclass
@@ -196,33 +202,38 @@ class BiliClient:
     API = "https://api.bilibili.com"
     COMMENT = "https://comment.bilibili.com"
 
-    def __init__(self, session: aiohttp.ClientSession, cookie: str = "") -> None:
+    WWW = "https://www.bilibili.com"
+
+    def __init__(self, session: aiohttp.ClientSession, cookie: str = "", logger: Optional[logging.Logger] = None) -> None:
         self._session = session
+        self.log = logger or logging.getLogger(__name__)
         self._cookies = parse_cookie(cookie)
         # 没有设备标识（buvid3）的请求更容易被风控；用户粘的 Cookie 里一般有，没有就向 B 站要一个
         self._device_ready = "buvid3" in self._cookies
         self._device_lock = asyncio.Lock()
         self._wbi: Tuple[str, float] = ("", 0.0)
         self._wbi_lock = asyncio.Lock()
-        self._blocked_until = 0.0
+        self._blocked_until: Dict[str, float] = {}  # 接口地址 → 暂停到什么时候
 
     @property
     def has_login_cookie(self) -> bool:
         return bool(self._cookies.get("SESSDATA"))
 
-    def _headers(self, referer: str = "https://www.bilibili.com/") -> Dict[str, str]:
+    def _headers(self, referer: str = "https://www.bilibili.com/", *, anonymous: bool = False, html: bool = False) -> Dict[str, str]:
+        cookies = {k: v for k, v in self._cookies.items() if not (anonymous and k in _LOGIN_COOKIES)}
         return {
             "User-Agent": USER_AGENT,
             "Referer": referer,
-            "Accept": "application/json, text/plain, */*",
+            "Accept": "text/html,application/xhtml+xml,*/*;q=0.8" if html else "application/json, text/plain, */*",
             "Accept-Language": "zh-CN,zh;q=0.9",
-            "Cookie": "; ".join(f"{k}={v}" for k, v in self._cookies.items()),
+            "Cookie": "; ".join(f"{k}={v}" for k, v in cookies.items()),
         }
 
     @property
     def blocked_seconds(self) -> int:
-        """还要暂停多少秒（被风控拦下后）。"""
-        return max(0, int(self._blocked_until - time.monotonic()))
+        """还要暂停多少秒（任一接口被风控拦下后）。"""
+        now = time.monotonic()
+        return max([0] + [int(until - now) for until in self._blocked_until.values()])
 
     async def _ensure_device(self) -> None:
         if self._device_ready:
@@ -246,45 +257,64 @@ class BiliClient:
             self._cookies.setdefault("buvid3", f"{uuid.uuid4()}infoc")
             self._cookies.setdefault("b_nut", str(int(time.time())))
 
-    async def _json(self, url: str, params: Optional[Dict[str, Any]] = None, *, referer: str = "https://www.bilibili.com/", timeout: float = 15) -> Dict[str, Any]:
+    async def _get(self, url: str, params: Optional[Dict[str, Any]], headers: Dict[str, str], timeout: float, *, text: bool) -> Any:
+        """一次请求。被风控拦下（412）时抛 blocked 的 BiliError。"""
         where = urlparse(url).path or url
-        if self.blocked_seconds:
-            raise BiliError(f"刚被 B 站风控拦过，{self.blocked_seconds} 秒后再试", f"{where} 暂停中")
+        try:
+            async with self._session.get(url, params=params, headers=headers, timeout=aiohttp.ClientTimeout(total=timeout)) as response:
+                if response.status == 412:
+                    raise BiliError(_ERRORS[-412], f"{where} HTTP 412", blocked=True)
+                if response.status >= 400:
+                    raise BiliError(f"B 站返回 HTTP {response.status}", f"{where} HTTP {response.status}")
+                if text:
+                    return await response.text(errors="replace")
+                return await response.json(content_type=None)
+        except asyncio.TimeoutError as exc:
+            raise BiliError("连接 B 站超时", f"{where} 超时") from exc
+        except aiohttp.ClientError as exc:
+            raise BiliError(f"连接 B 站失败（{type(exc).__name__}）", f"{where} {type(exc).__name__}") from exc
+        except ValueError as exc:
+            raise BiliError("B 站返回的内容看不懂", f"{where} 不是 JSON") from exc
+
+    async def _json(self, url: str, params: Optional[Dict[str, Any]] = None, *, referer: str = "https://www.bilibili.com/", timeout: float = 15) -> Dict[str, Any]:
+        """请求一个接口。被风控拦下时，先换成不带登录信息再试一次；还被拦就暂停这个接口一会。"""
+        where = urlparse(url).path or url
+        remaining = int(self._blocked_until.get(where, 0) - time.monotonic())
+        if remaining > 0:
+            raise BiliError(f"刚被 B 站风控拦过，{remaining} 秒后再试", f"{where} 暂停中", blocked=True)
         await self._ensure_device()
-        for attempt in (1, 2):
+        try:
+            payload = await self._get(url, params, self._headers(referer), timeout, text=False)
+        except BiliError as exc:
+            if not (exc.blocked and self.has_login_cookie):
+                if exc.blocked:
+                    self._blocked_until[where] = time.monotonic() + BLOCK_COOLDOWN
+                raise
             try:
-                async with self._session.get(
-                    url, params=params, headers=self._headers(referer), timeout=aiohttp.ClientTimeout(total=timeout)
-                ) as response:
-                    status = response.status
-                    if status == 412:
-                        if attempt == 1:
-                            await asyncio.sleep(BLOCK_RETRY_DELAY)
-                            continue
-                        self._blocked_until = time.monotonic() + BLOCK_COOLDOWN
-                        raise BiliError(_ERRORS[-412], f"{where} HTTP 412（重试后仍被拦）")
-                    if status >= 400:
-                        raise BiliError(f"B 站返回 HTTP {status}", f"{where} HTTP {status}")
-                    payload = await response.json(content_type=None)
-            except asyncio.TimeoutError as exc:
-                raise BiliError("连接 B 站超时", f"{where} 超时") from exc
-            except aiohttp.ClientError as exc:
-                raise BiliError(f"连接 B 站失败（{type(exc).__name__}）", f"{where} {type(exc).__name__}") from exc
-            except ValueError as exc:
-                raise BiliError("B 站返回的内容看不懂", f"{where} 不是 JSON") from exc
-            if not isinstance(payload, dict):
-                raise BiliError("B 站返回的内容看不懂", f"{where} 不是 JSON 对象")
-            if payload.get("code") in (-352, -412):
-                self._blocked_until = time.monotonic() + BLOCK_COOLDOWN
-            return payload
-        raise BiliError(_ERRORS[-412], where)  # 走不到这里
+                payload = await self._get(url, params, self._headers(referer, anonymous=True), timeout, text=False)
+            except BiliError as again:
+                if again.blocked:
+                    self._blocked_until[where] = time.monotonic() + BLOCK_COOLDOWN
+                    again.detail += "（带登录、不带登录都被拦）"
+                raise
+            self.log.info("B站视频：%s 带登录信息被风控拦下，不带登录信息成功了", where)
+        if not isinstance(payload, dict):
+            raise BiliError("B 站返回的内容看不懂", f"{where} 不是 JSON 对象")
+        if payload.get("code") in (-352, -412):
+            self._blocked_until[where] = time.monotonic() + BLOCK_COOLDOWN
+        return payload
+
+    async def _page(self, url: str) -> str:
+        """打开视频网页（接口被风控时的后备，网页和接口不是同一个入口）。"""
+        html = await self._get(url, None, self._headers(url, html=True), 15, text=True)
+        return str(html)[:5_000_000]
 
     @staticmethod
     def _data(payload: Dict[str, Any], *, allow: Tuple[int, ...] = ()) -> Dict[str, Any]:
         code = payload.get("code", 0)
         if code != 0 and code not in allow:
             message = _ERRORS.get(code, f"B 站返回错误 {code}：{str(payload.get('message', ''))[:60]}")
-            raise BiliError(message, f"code={code} message={str(payload.get('message', ''))[:60]}")
+            raise BiliError(message, f"code={code} message={str(payload.get('message', ''))[:60]}", blocked=code in (-352, -412))
         data = payload.get("data")
         return data if isinstance(data, dict) else {}
 
@@ -324,27 +354,27 @@ class BiliClient:
 
     async def view(self, ref: VideoRef) -> VideoInfo:
         params = {"bvid": ref.bvid} if ref.bvid else {"aid": ref.aid}
-        data = self._data(await self._json(f"{self.API}/x/web-interface/view", params))
-        pages = [p for p in data.get("pages") or [] if isinstance(p, dict)]
-        page_index = min(max(ref.page, 1), max(len(pages), 1)) - 1
-        page = pages[page_index] if pages else {}
-        owner = data.get("owner") if isinstance(data.get("owner"), dict) else {}
-        cid = int(page.get("cid") or data.get("cid") or 0)
-        if not cid:
-            raise BiliError("拿不到视频的分 P 信息")
-        return VideoInfo(
-            bvid=str(data.get("bvid") or ref.bvid),
-            aid=int(data.get("aid") or ref.aid or 0),
-            cid=cid,
-            page=page_index + 1,
-            title=str(data.get("title") or ""),
-            part_title=str(page.get("part") or ""),
-            owner=str(owner.get("name") or ""),
-            duration=int(page.get("duration") or data.get("duration") or 0),
-            description=str(data.get("desc") or "").strip(),
-            category=str(data.get("tname") or ""),
-            page_count=max(len(pages), 1),
-        )
+        try:
+            data = self._data(await self._json(f"{self.API}/x/web-interface/view", params))
+        except BiliError as exc:
+            if not exc.blocked:
+                raise
+            data = await self._view_from_page(ref, exc)
+        return _info_from_view(data, ref)
+
+    async def _view_from_page(self, ref: VideoRef, cause: BiliError) -> Dict[str, Any]:
+        try:
+            state = _embedded_json(_INITIAL_STATE, await self._page(self.WWW + ref.url.removeprefix("https://www.bilibili.com")))
+        except BiliError as exc:
+            cause.detail += f"；网页后备也失败：{exc.detail or exc}"
+            raise cause from exc
+        data = state.get("videoData") if isinstance(state.get("videoData"), dict) else {}
+        if not data.get("pages") and not data.get("cid"):
+            cause.detail += "；网页里没有视频信息"
+            raise cause
+        self.log.info("B站视频：视频信息接口被风控拦下，改从网页读取成功")
+        return data
+
 
     async def _wbi_key(self) -> str:
         async with self._wbi_lock:
@@ -369,16 +399,33 @@ class BiliClient:
     # ── 播放地址 ──────────────────────────────────
 
     async def media_plan(self, info: VideoInfo, quality: int) -> MediaPlan:
-        """优先要一个带声音的 mp4（不用 ffmpeg 合并），没有再用分开的画面和声音。"""
-        base = {"bvid": info.bvid, "cid": info.cid, "qn": quality, "fnver": 0, "fourk": 0, **_fingerprint_params()}
-        key = await self._wbi_key()
-        for fnval in (1, 4048):
-            data = self._data(
-                await self._json(f"{self.API}/x/player/wbi/playurl", sign_wbi({**base, "fnval": fnval}, key), referer=info.url)
-            )
+        """优先要一个带声音的 mp4（不用 ffmpeg 合并），没有再用分开的画面和声音。
+        播放地址接口被风控拦下时，改从视频网页里读（网页里也带着播放地址）。"""
+        try:
+            base = {"bvid": info.bvid, "cid": info.cid, "qn": quality, "fnver": 0, "fourk": 0, **_fingerprint_params()}
+            key = await self._wbi_key()
+            for fnval in (1, 4048):
+                data = self._data(
+                    await self._json(f"{self.API}/x/player/wbi/playurl", sign_wbi({**base, "fnval": fnval}, key), referer=info.url)
+                )
+                plan = _plan_from_play(data, quality)
+                if plan is not None:
+                    return plan
+        except BiliError as exc:
+            if not exc.blocked:
+                raise
+            try:
+                play = _embedded_json(_PLAYINFO, await self._page(self.WWW + info.url.removeprefix("https://www.bilibili.com")))
+            except BiliError as page_exc:
+                exc.detail += f"；网页后备也失败：{page_exc.detail or page_exc}"
+                raise exc from page_exc
+            data = play.get("data") if isinstance(play.get("data"), dict) else {}
             plan = _plan_from_play(data, quality)
-            if plan is not None:
-                return plan
+            if plan is None:
+                exc.detail += "；网页里没有可用的播放地址"
+                raise exc
+            self.log.info("B站视频：播放地址接口被风控拦下，改从网页读取成功")
+            return plan
         raise BiliError("B 站没给可以下载的视频地址")
 
     # ── 字幕和弹幕 ────────────────────────────────
@@ -503,3 +550,38 @@ def _plan_from_play(data: Dict[str, Any], quality: int) -> Optional[MediaPlan]:
     video = min(same, key=lambda v: (0 if int(v.get("codecid") or 0) == 7 else 1, int(v.get("bandwidth") or 0)))
     audio = min(audios, key=lambda a: int(a.get("bandwidth") or 0))
     return MediaPlan(video_url=_first_url(video), audio_url=_first_url(audio))
+
+
+def _embedded_json(pattern: "re.Pattern[str]", html: str) -> Dict[str, Any]:
+    match = pattern.search(html)
+    if not match:
+        return {}
+    try:
+        value = json.loads(match.group(1))
+    except ValueError:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _info_from_view(data: Dict[str, Any], ref: VideoRef) -> VideoInfo:
+    """视频信息接口（或网页里的 videoData）→ VideoInfo。"""
+    pages = [p for p in data.get("pages") or [] if isinstance(p, dict)]
+    page_index = min(max(ref.page, 1), max(len(pages), 1)) - 1
+    page = pages[page_index] if pages else {}
+    owner = data.get("owner") if isinstance(data.get("owner"), dict) else {}
+    cid = int(page.get("cid") or data.get("cid") or 0)
+    if not cid:
+        raise BiliError("拿不到视频的分 P 信息")
+    return VideoInfo(
+        bvid=str(data.get("bvid") or ref.bvid),
+        aid=int(data.get("aid") or ref.aid or 0),
+        cid=cid,
+        page=page_index + 1,
+        title=str(data.get("title") or ""),
+        part_title=str(page.get("part") or ""),
+        owner=str(owner.get("name") or ""),
+        duration=int(page.get("duration") or data.get("duration") or 0),
+        description=str(data.get("desc") or "").strip(),
+        category=str(data.get("tname") or ""),
+        page_count=max(len(pages), 1),
+    )
