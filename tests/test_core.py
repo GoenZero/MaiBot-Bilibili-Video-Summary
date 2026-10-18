@@ -98,9 +98,13 @@ def test_client_view_subtitles_danmaku_and_playurl():
         info = await client.view(VideoRef(aid=170001))
         assert info.cid == 170002 and info.bvid == BVID
 
-        assert await client.subtitles(info) == "00:01 大家好\n01:05 今天做饭"
-        world.subtitle_aid = 999  # 返回了别的视频的字幕：不用
-        assert await client.subtitles(info) == ""
+        text, chapters = await client.subtitles(info)
+        assert text == "00:01 大家好\n01:05 今天做饭"
+        assert [(c.start, c.title) for c in chapters] == [(0, "开场"), (65, "开始 做饭")]  # 按时间排好
+        world.view_points = [{"from": "坏数据"}, "也不对", {"from": 3, "content": ""}]
+        assert (await client.subtitles(info))[1] == []
+        world.subtitle_aid = 999  # 返回了别的视频的信息：不用
+        assert await client.subtitles(info) == ("", [])
 
         assert await client.hot_danmaku(info.cid) == ["哈哈哈哈", "猫：我没摔", "前排"]
 
@@ -202,6 +206,7 @@ def test_long_video_reads_subtitles_and_failures_fall_back(tmp_path, monkeypatch
         watcher = make_watcher(world, session, monkeypatch, tmp_path)
         text = await watcher.watch(BVID)
         assert "字幕内容" in text and "01:05 今天做饭" in text and "没有看画面" in text
+        assert "分段：00:00 开场 / 01:05 开始 做饭" in text
         assert world.qwen_payloads == []
 
         # 短视频但模型出错：退回读字幕，并说明原因；不缓存，下次还能重试
@@ -216,6 +221,7 @@ def test_long_video_reads_subtitles_and_failures_fall_back(tmp_path, monkeypatch
         watcher3 = make_watcher(world, session, monkeypatch, tmp_path / "w3", with_qwen=False)
         text = await watcher3.watch("BV1ww411c7mG")
         assert "没有配置看视频的模型" in text and "AI 字幕需要" in text
+        assert "分段：00:00 开场" in text  # 没字幕也能看到分段
         assert len(watcher3.cache) == 0
 
     run_with_world(test)
@@ -228,15 +234,16 @@ def test_long_subtitles_are_summarized_within_budget(tmp_path, monkeypatch):
         watcher = make_watcher(world, session, monkeypatch, tmp_path, max_chars=1000)
         calls = []
 
-        async def summarize(text: str, limit: int) -> str:
+        async def summarize(text: str, limit: int, chapters: str) -> str:
             calls.append(limit)
+            assert chapters == "00:00 开场 / 01:05 开始 做饭"
             return "这是压缩后的字幕摘要"
 
         watcher.summarize = summarize
         text = await watcher.watch(BVID)
         assert calls == [700] and "这是压缩后的字幕摘要" in text and len(text) <= 1000
 
-        async def broken(text: str, limit: int) -> str:
+        async def broken(text: str, limit: int, chapters: str) -> str:
             raise RuntimeError("模型挂了")
 
         watcher2 = make_watcher(world, session, monkeypatch, tmp_path / "w2", max_chars=1000)

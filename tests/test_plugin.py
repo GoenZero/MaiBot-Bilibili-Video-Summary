@@ -120,6 +120,16 @@ def test_long_video_uses_maibot_text_model_for_long_subtitles(tmp_path, monkeypa
         assert result["success"] is True and "压缩后的字幕" in result["content"]
         llm = [p for name, p in host.calls if name == "cap.call" and p["capability"] == "llm.generate"]
         assert llm and llm[0]["args"]["task_name"] == "utils"
+        prompt = llm[0]["args"]["prompt"]
+        assert "按这些分段逐段概括" in prompt and "00:00 开场 / 01:05 开始 做饭" in prompt
+        assert "分段：00:00 开场" in result["content"]
+
+        # 没有分段的视频：按时间分段概括，每段也带时间
+        world.view_points = []
+        result = await plugin.tool_watch(url="BV1zz411c7mF")
+        prompt = [p for name, p in host.calls if name == "cap.call" and p["capability"] == "llm.generate"][-1]["args"]["prompt"]
+        assert "视频没有分段" in prompt and "行首写这一段的开始时间" in prompt
+        assert "分段：" not in result["content"]
         assert world.qwen_payloads == []
         await plugin.on_unload()
 

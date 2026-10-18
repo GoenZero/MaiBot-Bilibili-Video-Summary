@@ -18,12 +18,13 @@ import logging
 import shutil
 import tempfile
 
-from .bilibili import BiliClient, BiliError, VideoInfo, format_seconds
+from .bilibili import BiliClient, BiliError, Chapter, VideoInfo, format_chapters, format_seconds
 from .links import VideoRef
 from .cache import ResultCache
 from .qwen import QwenClient, QwenError, build_video_prompt
 
-Summarizer = Callable[[str, int], Awaitable[str]]
+# (字幕全文, 字数上限, 分段说明) → 摘要；没有分段时分段说明为空字符串
+Summarizer = Callable[[str, int, str], Awaitable[str]]
 
 
 @dataclass
@@ -109,11 +110,11 @@ class Watcher:
         else:
             notes.append(f"视频较长（{format_seconds(info.duration)}），没有看画面，只读了字幕")
 
-        subtitle_text = ""
+        subtitle_text, chapters = "", []
         if video_text is None:
-            subtitle_text = await self._subtitle_text(info, notes)
+            subtitle_text, chapters = await self._subtitle_text(info, notes)
 
-        text = compose(info, video_text, subtitle_text, danmaku, notes, self.settings.max_chars)
+        text = compose(info, video_text, subtitle_text, danmaku, notes, self.settings.max_chars, chapters)
         if video_text or subtitle_text:
             self.cache.put(ref.key, text)  # 只缓存真正看到内容的结果，失败了下次还能重试
         return text
@@ -147,28 +148,29 @@ class Watcher:
         if audio is not None:
             await self.bili.download(audio_url, audio, referer=referer, max_bytes=max(1, budget - used))
 
-    async def _subtitle_text(self, info: VideoInfo, notes: List[str]) -> str:
+    async def _subtitle_text(self, info: VideoInfo, notes: List[str]) -> tuple[str, List[Chapter]]:
+        """字幕（短的原样、长的压缩，都带时间）和 UP 主标的分段。"""
         try:
-            subtitles = await self.bili.subtitles(info)
+            subtitles, chapters = await self.bili.subtitles(info)
         except BiliError as exc:
             notes.append(f"字幕没拿到：{exc}")
-            return ""
+            return "", []
         if not subtitles:
             hint = "" if self.bili.has_login_cookie else "（B 站的 AI 字幕需要在插件里填登录 Cookie）"
             notes.append(f"这个视频没有可用的字幕{hint}")
-            return ""
+            return "", chapters
         limit = int(self.settings.max_chars * 0.7)
         if len(subtitles) <= limit:
-            return subtitles
+            return subtitles, chapters
         if self.summarize is not None:
             try:
-                summary = (await self.summarize(subtitles, limit)).strip()
+                summary = (await self.summarize(subtitles, limit, format_chapters(chapters, limit=50))).strip()
                 if summary:
-                    return summary
+                    return summary, chapters
             except Exception as exc:  # noqa: BLE001 - 压缩失败就截断，不影响结果
                 self.log.warning("B站视频：字幕压缩失败：%s", exc)
         notes.append("字幕太长，只保留了开头部分")
-        return subtitles[:limit]
+        return subtitles[:limit], chapters
 
 
 def compose(
@@ -178,6 +180,7 @@ def compose(
     danmaku: List[str],
     notes: List[str],
     max_chars: int,
+    chapters: Optional[List[Chapter]] = None,
 ) -> str:
     """拼成交给 AI 的一段文字，总长不超过 max_chars。"""
     title = f"《{info.title}》" + (f"（P{info.page}：{info.part_title}）" if info.page_count > 1 and info.part_title else "")
@@ -188,6 +191,8 @@ def compose(
     if info.description and info.description != "-":
         desc = info.description.replace("\n", " ")
         head.append("简介：" + desc[:120] + ("…" if len(desc) > 120 else ""))
+    if chapters:
+        head.append("分段：" + format_chapters(chapters))
     tail: List[str] = []
     if danmaku:
         tail.append("热门弹幕：" + " ".join(f"「{d}」" for d in danmaku))
@@ -197,7 +202,7 @@ def compose(
     if video_text:
         label, body = "视频内容（看画面和声音得到的描述）：", video_text
     elif subtitle_text:
-        label, body = "字幕内容：", subtitle_text
+        label, body = "字幕内容（行首或段首是视频里的时间）：", subtitle_text
     else:
         label, body = "", ""
     fixed = "\n".join(head + tail)

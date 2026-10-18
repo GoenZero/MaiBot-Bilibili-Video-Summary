@@ -120,10 +120,18 @@ class BilibiliVideoPlugin(MaiBotPlugin):
         if session is not None:
             await session.close()
 
-    async def _summarize(self, subtitles: str, limit: int) -> str:
+    async def _summarize(self, subtitles: str, limit: int, chapters: str) -> str:
+        if chapters:
+            how = (
+                f"UP 主把视频分成了这些段：{chapters}\n"
+                "请按这些分段逐段概括，每段一行，行首写这一段的开始时间和段名，例如「03:12 开始做菜：……」。"
+            )
+        else:
+            how = "视频没有分段。请按时间顺序把内容分成几段概括，每段一行，行首写这一段的开始时间，例如「03:12 ……」。"
         prompt = (
-            f"下面是一个 B 站视频的字幕，每行开头是时间。请用中文按时间顺序概括主要内容和关键细节，{limit} 字以内，"
-            "可以保留几个关键时间点。只根据字幕内容，不要编造，不要加开场白。\n\n字幕：\n" + subtitles[:30000]
+            f"下面是一个 B 站视频的字幕，每行开头是时间。{how}"
+            f"保留关键细节（人名、数字、结论），总共 {limit} 字以内。只根据字幕内容，不要编造，不要加开场白。\n\n"
+            "字幕：\n" + subtitles[:30000]
         )
         result = await self.ctx.llm.generate(prompt, task_name=self.config.watch.summary_task.strip() or "utils")
         if not result.get("success", True) and not result.get("response"):

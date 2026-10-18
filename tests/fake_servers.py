@@ -26,6 +26,10 @@ class FakeWorld:
         self.duration = 95
         self.subtitles: List[Dict[str, Any]] = [{"from": 1.5, "to": 3, "content": "大家好"}, {"from": 65, "to": 67, "content": "今天做饭"}]
         self.subtitle_aid = 170001
+        self.view_points: List[Dict[str, Any]] = [
+            {"type": 2, "from": 65, "to": 120, "content": "开始  做饭", "imgUrl": "x"},
+            {"type": 2, "from": 0, "to": 65, "content": "开场", "imgUrl": "x"},
+        ]
         self.playurl_mode = "durl"
         self.bad_signatures = 0
         self.qwen_payloads: List[Dict[str, Any]] = []
@@ -124,7 +128,8 @@ class FakeWorld:
         self.check_signature(request)
         # 真实的 B 站给的是「//aisubtitle.hdslb.com/...」（插件会补上 https:）；本地假服务器只有 http，所以给完整地址
         tracks = [{"lan": "ai-zh", "subtitle_url": f"{self.base}/sub.json"}] if self.subtitles else []
-        return web.json_response({"code": 0, "data": {"aid": self.subtitle_aid, "cid": 170002, "subtitle": {"subtitles": tracks}}})
+        data = {"aid": self.subtitle_aid, "cid": 170002, "subtitle": {"subtitles": tracks}, "view_points": self.view_points}
+        return web.json_response({"code": 0, "data": data})
 
     async def subtitle_json(self, request: web.Request) -> web.Response:
         return web.json_response({"body": self.subtitles})

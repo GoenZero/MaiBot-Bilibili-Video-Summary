@@ -70,6 +70,22 @@ class VideoInfo:
         return f"https://www.bilibili.com/video/{self.bvid}" + (f"?p={self.page}" if self.page > 1 else "")
 
 
+@dataclass(frozen=True)
+class Chapter:
+    """UP 主在进度条上标的一段。"""
+
+    start: int  # 秒
+    title: str
+
+
+def format_chapters(chapters: List["Chapter"], limit: int = 15) -> str:
+    """「00:00 开场 / 03:12 开始做菜 / …」"""
+    shown = [f"{format_seconds(c.start)} {c.title}" for c in chapters[:limit]]
+    if len(chapters) > limit:
+        shown.append(f"……共 {len(chapters)} 段")
+    return " / ".join(shown)
+
+
 @dataclass
 class MediaPlan:
     """要交给视频模型的文件：一个带声音的 mp4，或者分开的画面和声音。"""
@@ -287,19 +303,21 @@ class BiliClient:
 
     # ── 字幕和弹幕 ────────────────────────────────
 
-    async def subtitles(self, info: VideoInfo) -> str:
-        """字幕全文（每行「分:秒 内容」）；没有字幕返回空字符串。AI 字幕要登录才拿得到。"""
+    async def subtitles(self, info: VideoInfo) -> Tuple[str, List[Chapter]]:
+        """字幕全文（每行「分:秒 内容」）和 UP 主标的分段，都在播放器信息这一个请求里。
+        没有字幕时字幕为空字符串；AI 字幕要登录才拿得到。"""
         key = await self._wbi_key()
         data = self._data(
             await self._json(f"{self.API}/x/player/wbi/v2", sign_wbi({"aid": info.aid, "cid": info.cid}, key), referer=info.url)
         )
-        # 偶尔会返回别的视频的字幕，对一下编号
+        # 偶尔会返回别的视频的信息，对一下编号
         if (data.get("aid") and int(data["aid"]) != info.aid) or (data.get("cid") and int(data["cid"]) != info.cid):
-            return ""
+            return "", []
+        chapters = _chapters(data.get("view_points"))
         subtitle = data.get("subtitle") if isinstance(data.get("subtitle"), dict) else {}
         tracks = [t for t in subtitle.get("subtitles") or [] if isinstance(t, dict) and t.get("subtitle_url")]
         if not tracks:
-            return ""
+            return "", chapters
 
         def rank(track: Dict[str, Any]) -> int:
             lan = str(track.get("lan", "")).lower()
@@ -318,7 +336,7 @@ class BiliClient:
             for item in body or []
             if isinstance(item, dict) and str(item.get("content") or "").strip()
         ]
-        return "\n".join(lines)
+        return "\n".join(lines), chapters
 
     async def hot_danmaku(self, cid: int, limit: int = 8) -> List[str]:
         """出现次数最多的几条弹幕。"""
@@ -363,6 +381,22 @@ class BiliClient:
             dest.unlink(missing_ok=True)
             raise BiliError(f"下载视频失败（{type(exc).__name__}）") from exc
         return size
+
+
+def _chapters(raw: Any) -> List[Chapter]:
+    """播放器信息里的 view_points：[{"from": 秒, "to": 秒, "content": 标题}, ...]，按时间排好。"""
+    chapters: List[Chapter] = []
+    for item in raw or []:
+        if not isinstance(item, dict):
+            continue
+        title = " ".join(str(item.get("content") or "").split())[:30]
+        try:
+            start = int(float(item.get("from") or 0))
+        except (TypeError, ValueError):
+            continue
+        if title:
+            chapters.append(Chapter(start, title))
+    return sorted(set(chapters), key=lambda c: c.start)
 
 
 def _first_url(item: Dict[str, Any]) -> str:
