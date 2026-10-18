@@ -426,3 +426,30 @@ def test_oss_error_reason_is_reported(tmp_path, monkeypatch):
             await qwen.describe(video, "描述")
 
     run_with_world(test)
+
+
+def test_failed_picture_is_not_cached_so_the_next_try_watches_again(tmp_path, monkeypatch):
+    """真机：画面失败、字幕成功的结果被缓存了 7 天，修好后再问也只拿到旧结果。"""
+
+    async def test(world, session):
+        world.qwen_status = 400
+        watcher = make_watcher(world, session, monkeypatch, tmp_path)
+        first = await watcher.watch(BVID)
+        assert "这次没能看到画面" in first and "今天做饭" in first
+        world.qwen_status = 200
+        second = await watcher.watch(BVID)
+        assert "笑点是它摔了下来" in second and "没能看到画面" not in second
+        assert len(world.qwen_payloads) == 2
+        assert await watcher.watch(BVID) == second and len(world.qwen_payloads) == 2  # 成功的结果照常缓存
+
+    run_with_world(test)
+
+
+def test_results_cached_by_an_older_version_are_ignored(tmp_path, monkeypatch):
+    async def test(world, session):
+        cache = ResultCache(tmp_path / "cache.json")
+        cache.put(f"{BVID}:p1", "旧版本缓存：这次没能看到画面：HTTP 400")  # 旧版本的键没有版本号
+        watcher = make_watcher(world, session, monkeypatch, tmp_path)
+        assert "笑点是它摔了下来" in await watcher.watch(BVID)
+
+    run_with_world(test)

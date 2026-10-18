@@ -26,6 +26,9 @@ from .qwen import QwenClient, QwenError, build_video_prompt
 # (字幕全文, 字数上限, 分段说明) → 摘要；没有分段时分段说明为空字符串
 Summarizer = Callable[[str, int, str], Awaitable[str]]
 
+# 缓存版本：缓存规则改了就加一，旧版本存的结果不再使用
+CACHE_VERSION = "v2"
+
 
 @dataclass
 class WatchSettings:
@@ -91,8 +94,9 @@ class Watcher:
 
     async def _work(self, link: str) -> str:
         ref = await self.bili.resolve(link)
-        cached = self.cache.get(ref.key)
+        cached = self.cache.get(self._key(ref))
         if cached is not None:
+            self.log.info("B站视频：用了之前看过的结果（%s），没有重新看", ref.key)
             return cached
         task = self._by_video.get(ref.key)
         if task is None:
@@ -138,7 +142,7 @@ class Watcher:
 
     async def _full_subtitles(self, ref: VideoRef, info: VideoInfo) -> str:
         """完整字幕，读过就缓存，追问别的段落时不用再向 B 站要。"""
-        key = f"{ref.key}:subtitles"
+        key = self._key(ref, "subtitles")
         cached = self.cache.get(key)
         if cached is not None:
             return cached
@@ -153,7 +157,8 @@ class Watcher:
         danmaku = await self.bili.hot_danmaku(info.cid) if self.settings.danmaku else []
 
         video_text: Optional[str] = None
-        if self.qwen is not None and info.duration <= self.settings.short_seconds:
+        wants_video = self.qwen is not None and info.duration <= self.settings.short_seconds
+        if wants_video:
             try:
                 video_text = await self._watch_video(info)
             except (BiliError, QwenError) as exc:
@@ -169,9 +174,15 @@ class Watcher:
             subtitle_text, chapters = await self._subtitle_text(ref, info, notes)
 
         text = compose(info, video_text, subtitle_text, danmaku, notes, self.settings.max_chars, chapters)
-        if video_text or subtitle_text:
-            self.cache.put(ref.key, text)  # 只缓存真正看到内容的结果，失败了下次还能重试
+        # 只缓存完整的结果：该看画面却没看成的（多半是临时问题）不缓存，下次还会重试
+        if video_text or (subtitle_text and not wants_video):
+            self.cache.put(self._key(ref), text)
+            self.log.info("B站视频：看完了（%s，%s）", info.bvid, "看了画面" if video_text else "读了字幕")
         return text
+
+    @staticmethod
+    def _key(ref: VideoRef, kind: str = "") -> str:
+        return f"{CACHE_VERSION}:{ref.key}" + (f":{kind}" if kind else "")
 
     async def _watch_video(self, info: VideoInfo) -> str:
         assert self.qwen is not None
@@ -211,7 +222,7 @@ class Watcher:
             notes.append(f"字幕没拿到：{exc}")
             return "", []
         if subtitles:
-            self.cache.put(f"{ref.key}:subtitles", subtitles)
+            self.cache.put(self._key(ref, "subtitles"), subtitles)
         if not subtitles:
             hint = "" if self.bili.has_login_cookie else "（B 站的 AI 字幕需要在插件里填登录 Cookie）"
             notes.append(f"这个视频没有可用的字幕{hint}")
