@@ -120,12 +120,19 @@ class WatchConfig(PluginConfigBase):
         description="下载视频最多等多少秒。",
         json_schema_extra={"label": "下载超时（秒）", "order": 6},
     )
+    upload_timeout: int = Field(
+        default=300,
+        ge=30,
+        le=900,
+        description="把视频传到百炼临时空间最多等多少秒。视频超过约 7MB 才需要上传；从国外连北京的百炼会比较慢。",
+        json_schema_extra={"label": "上传超时（秒）", "order": 7},
+    )
     model_timeout: int = Field(
         default=180,
         ge=30,
         le=600,
         description="百炼看视频最多等多少秒（不含下载和上传）。",
-        json_schema_extra={"label": "模型超时（秒）", "order": 7},
+        json_schema_extra={"label": "模型超时（秒）", "order": 8},
     )
 
 

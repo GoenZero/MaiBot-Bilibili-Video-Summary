@@ -73,6 +73,7 @@ def test_prefetch_then_tool_returns_the_same_result(tmp_path, monkeypatch):
 
     async def test(world):
         await plugin.on_load()
+        assert plugin._watcher.qwen.settings.upload_timeout == 300  # 默认放宽到 300 秒，可在 WebUI 调
         message = {"raw_message": [{"type": "text", "data": f"[链接] https://www.bilibili.com/video/{BVID}"}]}
         await plugin.on_inbound(message=message)
         result = await plugin.tool_watch(url=f"看看这个 https://www.bilibili.com/video/{BVID}", stream_id="s1")

@@ -17,11 +17,12 @@ import asyncio
 import logging
 import shutil
 import tempfile
+import time
 
 from .bilibili import BiliClient, BiliError, Chapter, VideoInfo, format_chapters, format_seconds, line_seconds
 from .links import VideoRef
 from .cache import ResultCache
-from .qwen import QwenClient, QwenError, build_video_prompt
+from .qwen import QwenClient, QwenError, _mb, build_video_prompt
 
 # (字幕全文, 字数上限, 分段说明) → 摘要；没有分段时分段说明为空字符串
 Summarizer = Callable[[str, int, str], Awaitable[str]]
@@ -196,10 +197,14 @@ class Watcher:
             try:
                 video_path = workdir / f"{info.bvid}.mp4"
                 audio_path = workdir / f"{info.bvid}.m4a" if plan.audio_url else None
+                started = time.monotonic()
                 try:
-                    await asyncio.wait_for(self._download_all(plan.video_url, plan.audio_url, video_path, audio_path, info.url), cfg.download_timeout)
+                    size = await asyncio.wait_for(
+                        self._download_all(plan.video_url, plan.audio_url, video_path, audio_path, info.url), cfg.download_timeout
+                    )
                 except asyncio.TimeoutError as exc:
                     raise BiliError(f"下载视频超过 {cfg.download_timeout:.0f} 秒") from exc
+                self.log.info("B站视频：下载完成（%s），%s 用了 %.0f 秒", info.bvid, _mb(size), time.monotonic() - started)
                 prompt = build_video_prompt(
                     info.title, info.owner, format_seconds(info.duration), info.description, max(300, cfg.max_chars - 400)
                 )
@@ -207,11 +212,12 @@ class Watcher:
             finally:
                 shutil.rmtree(workdir, ignore_errors=True)
 
-    async def _download_all(self, video_url: str, audio_url: str, video: Path, audio: Optional[Path], referer: str) -> None:
+    async def _download_all(self, video_url: str, audio_url: str, video: Path, audio: Optional[Path], referer: str) -> int:
         budget = self.settings.max_mb * 1048576
         used = await self.bili.download(video_url, video, referer=referer, max_bytes=budget)
         if audio is not None:
-            await self.bili.download(audio_url, audio, referer=referer, max_bytes=max(1, budget - used))
+            used += await self.bili.download(audio_url, audio, referer=referer, max_bytes=max(1, budget - used))
+        return used
 
     async def _subtitle_text(self, ref: VideoRef, info: VideoInfo, notes: List[str]) -> tuple[str, List[Chapter]]:
         """字幕（短的原样、长的压缩，都带时间）和 UP 主标的分段。完整字幕另外缓存，供只看某一段时用。"""

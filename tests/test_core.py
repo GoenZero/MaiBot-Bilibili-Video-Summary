@@ -453,3 +453,39 @@ def test_results_cached_by_an_older_version_are_ignored(tmp_path, monkeypatch):
         assert "笑点是它摔了下来" in await watcher.watch(BVID)
 
     run_with_world(test)
+
+
+def test_slow_upload_reports_size_and_speed_is_logged(tmp_path, monkeypatch):
+    """真机：从日本传 4 分钟的 360P 视频到北京的百炼超过了 120 秒；失败说明要带上文件大小，日志要写速度。"""
+
+    class Log:
+        def __init__(self) -> None:
+            self.lines: list[str] = []
+
+        def info(self, msg, *args):
+            self.lines.append(msg % args)
+
+        warning = info
+
+    async def test(world, session):
+        world.upload_policy_host = f"{world.base}/oss"
+        monkeypatch.setitem(qwen_module.REGIONS, "beijing", world.base)
+        monkeypatch.setattr(qwen_module, "is_trusted_upload_host", lambda url: url.startswith(world.base))
+        monkeypatch.setattr(qwen_module, "DATA_URL_LIMIT", 100)
+        video = tmp_path / "v.mp4"
+        video.write_bytes(b"\x01" * 3 * 1048576)
+        log = Log()
+        qwen = QwenClient(session, QwenSettings(api_key="k"), logger=log)
+        assert qwen.settings.upload_timeout == 300
+        assert "猫" in await qwen.describe(video, "描述")
+        assert any("上传完成，3.0MB" in line and "/秒" in line for line in log.lines)
+
+        async def stuck(*args, **kwargs):
+            await asyncio.sleep(5)
+
+        monkeypatch.setattr(qwen, "_upload", stuck)
+        qwen.settings.upload_timeout = 0.1
+        with pytest.raises(QwenError, match=r"超过 0 秒（视频约 3.0MB，网络上传太慢）"):
+            await qwen.describe(video, "描述")
+
+    run_with_world(test)

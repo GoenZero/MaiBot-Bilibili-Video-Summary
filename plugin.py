@@ -96,8 +96,10 @@ class BilibiliVideoPlugin(MaiBotPlugin):
                     region=cfg.qwen.region,
                     model=cfg.qwen.model.strip() or "qwen3.5-omni-plus",
                     fps=cfg.qwen.fps,
+                    upload_timeout=float(cfg.watch.upload_timeout),
                     model_timeout=float(cfg.watch.model_timeout),
                 ),
+                logger=self.ctx.logger,
             )
         settings = WatchSettings(
             short_seconds=cfg.watch.short_minutes * 60,
@@ -181,7 +183,7 @@ class BilibiliVideoPlugin(MaiBotPlugin):
                 name="end", param_type=ToolParamType.STRING, description="只看一段时：结束时间，例如 10:50；不填就看到开始时间之后 5 分钟", required=False
             ),
         ],
-        timeout_ms=600_000,
+        timeout_ms=1_200_000,
     )
     async def tool_watch(self, url: str = "", start: str = "", end: str = "", **kwargs: Any) -> Dict[str, Any]:
         del kwargs

@@ -61,7 +61,7 @@ class FakeWorld:
             self.bad_signatures += 1
 
     def app(self) -> web.Application:
-        app = web.Application()
+        app = web.Application(client_max_size=64 * 1024 * 1024)
         app.router.add_get("/x/web-interface/nav", self.nav)
         app.router.add_get("/x/frontend/finger/spi", self.spi)
         app.router.add_get("/x/web-interface/view", self.view)

@@ -15,7 +15,9 @@ from urllib.parse import urlparse
 import asyncio
 import base64
 import json
+import logging
 import re
+import time
 import uuid
 
 import aiohttp
@@ -46,7 +48,7 @@ class QwenSettings:
     fps: float = 1.0
     max_pixels: int = 307200
     max_tokens: int = 1200
-    upload_timeout: float = 120.0
+    upload_timeout: float = 300.0
     model_timeout: float = 180.0
 
     @property
@@ -68,27 +70,23 @@ def build_video_prompt(title: str, owner: str, duration: str, description: str, 
 
 
 class QwenClient:
-    def __init__(self, session: aiohttp.ClientSession, settings: QwenSettings) -> None:
+    def __init__(self, session: aiohttp.ClientSession, settings: QwenSettings, logger: Optional[Any] = None) -> None:
         self._session = session
         self.settings = settings
+        self.log = logger or logging.getLogger(__name__)
 
     async def describe(self, video: Path, prompt: str, audio: Optional[Path] = None) -> str:
         cfg = self.settings
         if not cfg.api_key:
             raise QwenError("没有填百炼的 API Key")
-        uses_oss = False
         try:
-            video_ref, oss1 = await asyncio.wait_for(self._prepare(video, "video/mp4"), cfg.upload_timeout)
-            content: List[Dict[str, Any]] = [
-                {"type": "video_url", "video_url": {"url": video_ref}, "fps": cfg.fps, "max_pixels": cfg.max_pixels}
-            ]
-            uses_oss = oss1
-            if audio is not None:
-                audio_ref, oss2 = await asyncio.wait_for(self._prepare(audio, "audio/mp4"), cfg.upload_timeout)
-                content.append({"type": "input_audio", "input_audio": {"data": audio_ref, "format": "m4a"}})
-                uses_oss = uses_oss or oss2
+            # 画面和声音（如果分开）一起算在同一个上传时限里
+            content, uses_oss = await asyncio.wait_for(self._prepare_all(video, audio), cfg.upload_timeout)
         except asyncio.TimeoutError as exc:
-            raise QwenError(f"上传视频到百炼超过 {cfg.upload_timeout:.0f} 秒") from exc
+            total = video.stat().st_size + (audio.stat().st_size if audio is not None else 0)
+            raise QwenError(
+                f"上传视频到百炼超过 {cfg.upload_timeout:.0f} 秒（视频约 {_mb(total)}，网络上传太慢）"
+            ) from exc
         content.append({"type": "text", "text": prompt})
         payload = {
             "model": cfg.model,
@@ -102,6 +100,18 @@ class QwenClient:
             return await asyncio.wait_for(self._stream(payload, uses_oss), cfg.model_timeout)
         except asyncio.TimeoutError as exc:
             raise QwenError(f"百炼看视频超过 {cfg.model_timeout:.0f} 秒") from exc
+
+    async def _prepare_all(self, video: Path, audio: Optional[Path]) -> tuple[List[Dict[str, Any]], bool]:
+        cfg = self.settings
+        video_ref, uses_oss = await self._prepare(video, "video/mp4")
+        content: List[Dict[str, Any]] = [
+            {"type": "video_url", "video_url": {"url": video_ref}, "fps": cfg.fps, "max_pixels": cfg.max_pixels}
+        ]
+        if audio is not None:
+            audio_ref, audio_oss = await self._prepare(audio, "audio/mp4")
+            content.append({"type": "input_audio", "input_audio": {"data": audio_ref, "format": "m4a"}})
+            uses_oss = uses_oss or audio_oss
+        return content, uses_oss
 
     async def _prepare(self, path: Path, mime: str) -> tuple[str, bool]:
         size = path.stat().st_size
@@ -143,6 +153,9 @@ class QwenClient:
             ("key", key),
             ("success_action_status", "200"),
         ]
+        size = path.stat().st_size
+        self.log.info("B站视频：开始把 %s 传到百炼临时空间", _mb(size))
+        started = time.monotonic()
         try:
             body = OssFormPayload(path, fields=fields, content_type=mime)
             timeout = aiohttp.ClientTimeout(total=None, sock_connect=20, sock_read=cfg.upload_timeout)
@@ -154,6 +167,8 @@ class QwenClient:
             raise QwenError(f"上传视频到百炼超过 {cfg.upload_timeout:.0f} 秒没有回音") from exc
         except aiohttp.ClientError as exc:
             raise QwenError(f"上传视频到百炼失败（{type(exc).__name__}）") from exc
+        elapsed = max(time.monotonic() - started, 0.001)
+        self.log.info("B站视频：上传完成，%s 用了 %.0f 秒（约 %s/秒）", _mb(size), elapsed, _mb(size / elapsed))
         return f"oss://{key}"
 
     async def _stream(self, payload: Dict[str, Any], uses_oss: bool) -> str:
@@ -240,6 +255,13 @@ class OssFormPayload(aiohttp.payload.Payload):
             while chunk := handle.read(1024 * 1024):
                 await writer.write(chunk)
         await writer.write(self._tail)
+
+
+def _mb(size: float) -> str:
+    """字节数写成「12.3MB」或「850KB」，给日志和错误说明用。"""
+    if size >= 1048576:
+        return f"{size / 1048576:.1f}MB"
+    return f"{max(size / 1024, 0.1):.0f}KB" if size >= 1024 else f"{size:.0f}B"
 
 
 def _oss_message(body: str) -> str:
