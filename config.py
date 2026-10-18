@@ -124,14 +124,14 @@ class WatchConfig(PluginConfigBase):
         default=300,
         ge=30,
         le=900,
-        description="把视频传到百炼临时空间最多等多少秒。视频超过约 7MB 才需要上传；从国外连北京的百炼会比较慢。",
+        description="把视频发给百炼（直接放进请求或传到临时空间）最多等多少秒。从国外连北京的百炼会比较慢。",
         json_schema_extra={"label": "上传超时（秒）", "order": 7},
     )
     model_timeout: int = Field(
-        default=180,
+        default=300,
         ge=30,
         le=600,
-        description="百炼看视频最多等多少秒（不含下载和上传）。",
+        description="视频发过去以后，百炼看视频最多等多少秒（不含下载和发送）。几分钟的视频，模型可能要想两三分钟。",
         json_schema_extra={"label": "模型超时（秒）", "order": 8},
     )
 

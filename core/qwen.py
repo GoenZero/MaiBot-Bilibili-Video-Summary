@@ -49,7 +49,7 @@ class QwenSettings:
     max_pixels: int = 307200
     max_tokens: int = 1200
     upload_timeout: float = 300.0
-    model_timeout: float = 180.0
+    model_timeout: float = 300.0
 
     @property
     def host(self) -> str:
@@ -100,10 +100,17 @@ class QwenClient:
             "stream_options": {"include_usage": True},
             "max_tokens": cfg.max_tokens,
         }
+        # 视频直接放在请求里时，请求本身就有十几 MB，从国外发过去也要时间（真机发现）：
+        # 发送算在上传时限里，发完以后模型思考算在模型时限里，超时时说清楚卡在哪一步
+        body = RequestBody(json.dumps(payload, ensure_ascii=False).encode())
         try:
-            return await asyncio.wait_for(self._stream(payload, uses_oss), cfg.model_timeout)
+            return await asyncio.wait_for(self._stream(body, uses_oss), cfg.upload_timeout + cfg.model_timeout)
         except asyncio.TimeoutError as exc:
-            raise QwenError(f"百炼看视频超过 {cfg.model_timeout:.0f} 秒") from exc
+            if body.finished_at is None:
+                note = f"请求约 {_mb(body.size)}，只发出了 {_mb(body.sent)}，网络上传太慢"
+                self.last_upload = f"超时：{note}"
+                raise QwenError(f"把视频发给百炼超过时限（{note}）") from exc
+            raise QwenError(f"百炼看视频超过 {time.monotonic() - body.finished_at:.0f} 秒（视频已经发过去了，是模型那边慢）") from exc
 
     def _upload_progress(self, video: Path, audio: Optional[Path]) -> str:
         """上传超时时说明传到哪了：只传了一部分是网络慢；全传完了还没回音是阿里云那边没响应。"""
@@ -190,7 +197,7 @@ class QwenClient:
         self.log.info("B站视频：上传完成，%s", self.last_upload)
         return f"oss://{key}"
 
-    async def _stream(self, payload: Dict[str, Any], uses_oss: bool) -> str:
+    async def _stream(self, body: "RequestBody", uses_oss: bool) -> str:
         cfg = self.settings
         headers = {
             "Authorization": f"Bearer {cfg.api_key}",
@@ -205,8 +212,9 @@ class QwenClient:
         timeout = aiohttp.ClientTimeout(total=None, sock_connect=20, sock_read=cfg.model_timeout)
         try:
             async with self._session.post(
-                f"{cfg.host}/compatible-mode/v1/chat/completions", json=payload, headers=headers, timeout=timeout
+                f"{cfg.host}/compatible-mode/v1/chat/completions", data=body, headers=headers, timeout=timeout
             ) as response:
+                body.log_sent(self)
                 if response.status >= 400:
                     raise QwenError(f"百炼返回 HTTP {response.status}：{_api_message(await response.text())}")
                 async for raw in response.content:
@@ -226,7 +234,8 @@ class QwenClient:
                         if isinstance(delta, dict) and isinstance(delta.get("content"), str):
                             chunks.append(delta["content"])
         except aiohttp.ServerTimeoutError as exc:
-            raise QwenError(f"百炼看视频超过 {cfg.model_timeout:.0f} 秒没有回音") from exc
+            body.log_sent(self)
+            raise QwenError(f"百炼看视频超过 {cfg.model_timeout:.0f} 秒没有回音（视频已经发过去了，是模型那边慢）") from exc
         except aiohttp.ClientError as exc:
             raise QwenError(f"连接百炼失败（{type(exc).__name__}）") from exc
         text = "".join(chunks).strip()
@@ -239,6 +248,39 @@ def is_trusted_upload_host(url: str) -> bool:
     """只往阿里云的地址传视频，防止被引到别处。"""
     parsed = urlparse(url)
     return parsed.scheme == "https" and (parsed.hostname or "").endswith(".aliyuncs.com")
+
+
+class RequestBody(aiohttp.payload.Payload):
+    """发给模型的请求体：分小块发出，记下发出了多少、什么时候发完，用来区分「网络慢」和「模型慢」。"""
+
+    def __init__(self, data: bytes) -> None:
+        super().__init__(None, content_type="application/json")
+        self._data = data
+        self._size = len(data)
+        self.sent = 0
+        self.started_at = time.monotonic()
+        self.finished_at: Optional[float] = None
+        self._logged = False
+
+    def decode(self, encoding: str = "utf-8", errors: str = "strict") -> str:
+        return self._data.decode(encoding, errors)
+
+    async def write(self, writer: Any) -> None:
+        view = memoryview(self._data)
+        for start in range(0, len(view), 256 * 1024):
+            piece = view[start : start + 256 * 1024]
+            await writer.write(piece)
+            self.sent += len(piece)
+        self.finished_at = time.monotonic()
+
+    def log_sent(self, client: "QwenClient") -> None:
+        """请求发完后写一行日志（大请求才写，只写一次）；/bili_status 也能看到。"""
+        if self._logged or self.finished_at is None or self.size < 1048576:
+            return
+        self._logged = True
+        elapsed = max(self.finished_at - self.started_at, 0.001)
+        client.last_upload = f"直接发送 {_mb(self.size)} 用了 {elapsed:.0f} 秒（约 {_mb(self.size / elapsed)}/秒）"
+        client.log.info("B站视频：视频已发给百炼，%s；等模型看完", client.last_upload)
 
 
 class OssFormPayload(aiohttp.payload.Payload):

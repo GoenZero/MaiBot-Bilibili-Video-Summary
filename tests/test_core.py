@@ -531,3 +531,22 @@ def test_separate_streams_estimate_size_from_bitrate():
     assert bili_module._plan_from_play(data, 16).video_url == "http://x/combined.mp4"
     plan = bili_module._plan_from_play(data, 16, separate=True)
     assert (plan.video_url, plan.size_hint, plan.audio_size_hint) == ("http://x/v", 6_000_000, 1_920_000)
+
+
+def test_inline_request_reports_send_time_and_blames_the_right_step(tmp_path, monkeypatch):
+    """真机：视频直接放进请求后（约 11MB），「百炼看视频超过 180 秒」分不清是发送慢还是模型慢。"""
+
+    async def test(world, session):
+        qwen = qwen_for(world, session, monkeypatch)
+        video = tmp_path / "v.mp4"
+        video.write_bytes(b"\x01" * 1_500_000)
+        assert "猫" in await qwen.describe(video, "描述")
+        assert qwen.last_upload.startswith("直接发送 1.9MB 用了")
+
+        world.qwen_delay = 2
+        qwen.settings.upload_timeout = 0.3
+        qwen.settings.model_timeout = 0.3
+        with pytest.raises(QwenError, match="视频已经发过去了，是模型那边慢"):
+            await qwen.describe(video, "描述")
+
+    run_with_world(test)

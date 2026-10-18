@@ -237,7 +237,7 @@ class BilibiliVideoPlugin(MaiBotPlugin):
         if watcher is not None and watcher.last_download:
             lines.append(f"最近一次下载视频：{watcher.last_download}")
         if watcher is not None and watcher.qwen is not None and watcher.qwen.last_upload:
-            lines.append(f"最近一次上传到百炼临时空间：{watcher.qwen.last_upload}")
+            lines.append(f"最近一次把视频发给百炼：{watcher.qwen.last_upload}")
         lines.append(f"已缓存：{len(self._cache) if self._cache else 0} 条")
         if watcher is not None and watcher.bili.blocked_seconds:
             lines.append(f"⚠️ 刚被 B 站风控拦过，{watcher.bili.blocked_seconds} 秒内暂停请求")
