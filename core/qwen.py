@@ -15,6 +15,8 @@ from urllib.parse import urlparse
 import asyncio
 import base64
 import json
+import re
+import uuid
 
 import aiohttp
 
@@ -129,28 +131,25 @@ class QwenClient:
         if any(not policy.get(name) for name in needed):
             raise QwenError("百炼的临时上传凭证不完整")
         upload_host = str(policy["upload_host"])
-        parsed = urlparse(upload_host)
-        if parsed.scheme != "https" or not (parsed.hostname or "").endswith(".aliyuncs.com"):
+        if not is_trusted_upload_host(upload_host):
             raise QwenError("百炼给的上传地址不可信，已停止上传")
         key = f"{str(policy['upload_dir']).rstrip('/')}/{path.name}"
-        form = aiohttp.FormData()
-        for name, value in (
-            ("OSSAccessKeyId", policy["oss_access_key_id"]),
-            ("Signature", policy["signature"]),
-            ("policy", policy["policy"]),
-            ("x-oss-object-acl", policy["x_oss_object_acl"]),
-            ("x-oss-forbid-overwrite", policy["x_oss_forbid_overwrite"]),
+        fields = [
+            ("OSSAccessKeyId", str(policy["oss_access_key_id"])),
+            ("Signature", str(policy["signature"])),
+            ("policy", str(policy["policy"])),
+            ("x-oss-object-acl", str(policy["x_oss_object_acl"])),
+            ("x-oss-forbid-overwrite", str(policy["x_oss_forbid_overwrite"])),
             ("key", key),
             ("success_action_status", "200"),
-        ):
-            form.add_field(name, str(value))
+        ]
         try:
-            with path.open("rb") as handle:  # aiohttp 边读边传，不把文件整个读进内存
-                form.add_field("file", handle, filename=path.name, content_type=mime)
-                timeout = aiohttp.ClientTimeout(total=None, sock_connect=20, sock_read=cfg.upload_timeout)
-                async with self._session.post(upload_host, data=form, timeout=timeout) as response:
-                    if response.status != 200:
-                        raise QwenError(f"上传视频到百炼临时空间失败：HTTP {response.status}")
+            body = OssFormPayload(path, fields=fields, content_type=mime)
+            timeout = aiohttp.ClientTimeout(total=None, sock_connect=20, sock_read=cfg.upload_timeout)
+            async with self._session.post(upload_host, data=body, timeout=timeout) as response:
+                if response.status != 200:
+                    reason = _oss_message(await response.text(errors="replace"))
+                    raise QwenError(f"上传视频到百炼临时空间失败：HTTP {response.status} {reason}".rstrip())
         except aiohttp.ServerTimeoutError as exc:
             raise QwenError(f"上传视频到百炼超过 {cfg.upload_timeout:.0f} 秒没有回音") from exc
         except aiohttp.ClientError as exc:
@@ -200,6 +199,54 @@ class QwenClient:
         if not text:
             raise QwenError("百炼没有返回内容")
         return text
+
+
+def is_trusted_upload_host(url: str) -> bool:
+    """只往阿里云的地址传视频，防止被引到别处。"""
+    parsed = urlparse(url)
+    return parsed.scheme == "https" and (parsed.hostname or "").endswith(".aliyuncs.com")
+
+
+class OssFormPayload(aiohttp.payload.Payload):
+    """阿里云 OSS 表单上传用的请求体：总长度事先算好，文本字段不带 Content-Type，文件放最后，边读边发。
+
+    aiohttp 自带的表单会给每个文本字段加「Content-Type: text/plain」，OSS 不认，返回 HTTP 400（真机发现）。
+    做法参考 maibot-qwen-video（MIT 许可，© 2026 MaiBot Community）。
+    """
+
+    def __init__(self, path: Path, *, fields: List[tuple[str, str]], content_type: str) -> None:
+        self._path = path
+        boundary = uuid.uuid4().hex
+        parts: List[bytes] = []
+        for name, value in fields:
+            if any(ch in name + value for ch in "\r\n\""):
+                raise QwenError("上传表单里有不该出现的字符")
+            parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'.encode())
+        parts.append(
+            f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{path.name}"\r\n'
+            f"Content-Type: {content_type}\r\n\r\n".encode()
+        )
+        self._head = b"".join(parts)
+        self._tail = f"\r\n--{boundary}--\r\n".encode()
+        super().__init__(None, content_type=f"multipart/form-data; boundary={boundary}")
+        self._size = len(self._head) + path.stat().st_size + len(self._tail)
+
+    def decode(self, encoding: str = "utf-8", errors: str = "strict") -> str:
+        raise TypeError("上传表单不能当文字读")
+
+    async def write(self, writer: Any) -> None:
+        await writer.write(self._head)
+        with self._path.open("rb") as handle:
+            while chunk := handle.read(1024 * 1024):
+                await writer.write(chunk)
+        await writer.write(self._tail)
+
+
+def _oss_message(body: str) -> str:
+    """阿里云 OSS 的错误是 XML：取出 Code 和 Message，方便看日志排查。"""
+    code = re.search(r"<Code>(.*?)</Code>", body or "")
+    message = re.search(r"<Message>(.*?)</Message>", body or "")
+    return " ".join(m.group(1) for m in (code, message) if m)[:200]
 
 
 def _api_message(body: str) -> str:

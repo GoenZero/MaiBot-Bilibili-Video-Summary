@@ -390,3 +390,39 @@ def test_short_video_still_watched_when_api_is_blocked(tmp_path, monkeypatch):
         assert "笑点是它摔了下来" in text and world.page_hits == 2  # 视频信息、播放地址都从网页拿到
 
     run_with_world(test)
+
+
+def test_large_video_is_uploaded_in_an_oss_compatible_form(tmp_path, monkeypatch):
+    """真机：aiohttp 自带表单给文本字段加了 Content-Type，阿里云 OSS 返回 HTTP 400。"""
+
+    async def test(world, session):
+        qwen = qwen_for(world, session, monkeypatch)
+        world.upload_policy_host = f"{world.base}/oss"
+        monkeypatch.setattr(qwen_module, "is_trusted_upload_host", lambda url: url.startswith(world.base))
+        monkeypatch.setattr(qwen_module, "DATA_URL_LIMIT", 100)  # 让 1000 字节的文件也走上传
+        video = tmp_path / "BV1xx.mp4"
+        video.write_bytes(b"\x01" * 1000)
+        assert "猫" in await qwen.describe(video, "描述")
+        upload = world.oss_uploads[-1]
+        assert upload["size"] == 1000 and upload["fields"]["key"] == "dashscope-instant/abc/BV1xx.mp4"
+        assert upload["fields"]["success_action_status"] == "200"
+        part = world.qwen_payloads[-1]["messages"][1]["content"][0]
+        assert part["video_url"]["url"] == "oss://dashscope-instant/abc/BV1xx.mp4"
+        assert world.qwen_headers[-1].get("X-DashScope-OssResourceResolve") == "enable"
+
+    run_with_world(test)
+
+
+def test_oss_error_reason_is_reported(tmp_path, monkeypatch):
+    async def test(world, session):
+        qwen = qwen_for(world, session, monkeypatch)
+        world.upload_policy_host = f"{world.base}/oss"
+        world.upload_dir = "somewhere-else"  # 假 OSS 会拒绝，并给出 XML 错误说明
+        monkeypatch.setattr(qwen_module, "is_trusted_upload_host", lambda url: url.startswith(world.base))
+        monkeypatch.setattr(qwen_module, "DATA_URL_LIMIT", 100)
+        video = tmp_path / "v.mp4"
+        video.write_bytes(b"\x01" * 1000)
+        with pytest.raises(QwenError, match="HTTP 400 InvalidArgument missing file or key"):
+            await qwen.describe(video, "描述")
+
+    run_with_world(test)

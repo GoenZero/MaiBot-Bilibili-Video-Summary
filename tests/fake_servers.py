@@ -38,6 +38,9 @@ class FakeWorld:
         self.qwen_status = 200
         self.qwen_delay = 0.0  # 模型开始回文字前的停顿（秒）
         self.upload_policy_host = "http://127.0.0.1/evil"
+        self.oss_uploads: List[Dict[str, Any]] = []
+        self.upload_dir = "dashscope-instant/abc"
+        self.qwen_headers: List[Dict[str, str]] = []
         self.video_size = len(VIDEO_BYTES)
         self.media_hits = 0
         self.base = ""
@@ -72,6 +75,7 @@ class FakeWorld:
         app.router.add_get("/video/{ident}", self.video_page)
         app.router.add_get("/api/v1/uploads", self.upload_policy)
         app.router.add_post("/compatible-mode/v1/chat/completions", self.chat)
+        app.router.add_post("/oss", self.oss_upload)
         return app
 
     async def nav(self, request: web.Request) -> web.Response:
@@ -204,7 +208,7 @@ class FakeWorld:
         return web.json_response(
             {
                 "data": {
-                    "upload_dir": "dashscope-instant/abc",
+                    "upload_dir": self.upload_dir,
                     "oss_access_key_id": "id",
                     "signature": "sig",
                     "policy": "p",
@@ -215,7 +219,34 @@ class FakeWorld:
             }
         )
 
+    async def oss_upload(self, request: web.Request) -> web.Response:
+        """像阿里云 OSS 一样挑剔：要有总长度，文本字段不能带 Content-Type，文件必须放最后。"""
+
+        def error(code: str, message: str) -> web.Response:
+            xml = f"<?xml version=\"1.0\"?><Error><Code>{code}</Code><Message>{message}</Message></Error>"
+            return web.Response(status=400, text=xml, content_type="application/xml")
+
+        if not request.headers.get("Content-Length"):
+            return error("MissingContentLength", "You must provide the Content-Length HTTP header.")
+        reader = await request.multipart()
+        fields: Dict[str, str] = {}
+        file_size = -1
+        while (part := await reader.next()) is not None:
+            if file_size >= 0:
+                return error("InvalidArgument", "file must be the last field")
+            if part.name == "file":
+                file_size = len(await part.read())
+            else:
+                if part.headers.get("Content-Type"):
+                    return error("InvalidPolicyDocument", "form field must not have Content-Type")
+                fields[part.name or ""] = (await part.read()).decode()
+        if file_size < 0 or not fields.get("key", "").startswith("dashscope-instant/abc/"):
+            return error("InvalidArgument", "missing file or key")
+        self.oss_uploads.append({"fields": fields, "size": file_size})
+        return web.Response(status=200)
+
     async def chat(self, request: web.Request) -> web.StreamResponse:
+        self.qwen_headers.append(dict(request.headers))
         self.qwen_payloads.append(await request.json())
         if self.qwen_status != 200:
             return web.json_response({"error": {"message": "Arrearage"}}, status=self.qwen_status)
