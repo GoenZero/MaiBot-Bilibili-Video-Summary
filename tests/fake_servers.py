@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
+import asyncio
 import hashlib
 import json
 from urllib.parse import urlencode
@@ -35,6 +36,7 @@ class FakeWorld:
         self.qwen_payloads: List[Dict[str, Any]] = []
         self.qwen_reply = ["画面里一只猫", "跳上了桌子，笑点是它摔了下来。"]
         self.qwen_status = 200
+        self.qwen_delay = 0.0  # 模型开始回文字前的停顿（秒）
         self.upload_policy_host = "http://127.0.0.1/evil"
         self.video_size = len(VIDEO_BYTES)
         self.media_hits = 0
@@ -181,6 +183,8 @@ class FakeWorld:
         self.qwen_payloads.append(await request.json())
         if self.qwen_status != 200:
             return web.json_response({"error": {"message": "Arrearage"}}, status=self.qwen_status)
+        if self.qwen_delay:
+            await asyncio.sleep(self.qwen_delay)  # 先看完视频，期间一个字节都不发
         response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
         await response.prepare(request)
         for piece in self.qwen_reply:

@@ -147,9 +147,12 @@ class QwenClient:
         try:
             with path.open("rb") as handle:  # aiohttp 边读边传，不把文件整个读进内存
                 form.add_field("file", handle, filename=path.name, content_type=mime)
-                async with self._session.post(upload_host, data=form) as response:
+                timeout = aiohttp.ClientTimeout(total=None, sock_connect=20, sock_read=cfg.upload_timeout)
+                async with self._session.post(upload_host, data=form, timeout=timeout) as response:
                     if response.status != 200:
                         raise QwenError(f"上传视频到百炼临时空间失败：HTTP {response.status}")
+        except aiohttp.ServerTimeoutError as exc:
+            raise QwenError(f"上传视频到百炼超过 {cfg.upload_timeout:.0f} 秒没有回音") from exc
         except aiohttp.ClientError as exc:
             raise QwenError(f"上传视频到百炼失败（{type(exc).__name__}）") from exc
         return f"oss://{key}"
@@ -164,8 +167,13 @@ class QwenClient:
         if uses_oss:
             headers["X-DashScope-OssResourceResolve"] = "enable"
         chunks: List[str] = []
+        # 模型要先把整段视频看完才开始回文字，这期间连接上一个字节都没有；
+        # 所以「多久没收到数据就断开」要按模型超时来，不能用会话默认的 60 秒（真机发现）
+        timeout = aiohttp.ClientTimeout(total=None, sock_connect=20, sock_read=cfg.model_timeout)
         try:
-            async with self._session.post(f"{cfg.host}/compatible-mode/v1/chat/completions", json=payload, headers=headers) as response:
+            async with self._session.post(
+                f"{cfg.host}/compatible-mode/v1/chat/completions", json=payload, headers=headers, timeout=timeout
+            ) as response:
                 if response.status >= 400:
                     raise QwenError(f"百炼返回 HTTP {response.status}：{_api_message(await response.text())}")
                 async for raw in response.content:
@@ -184,6 +192,8 @@ class QwenClient:
                         delta = choices[0].get("delta")
                         if isinstance(delta, dict) and isinstance(delta.get("content"), str):
                             chunks.append(delta["content"])
+        except aiohttp.ServerTimeoutError as exc:
+            raise QwenError(f"百炼看视频超过 {cfg.model_timeout:.0f} 秒没有回音") from exc
         except aiohttp.ClientError as exc:
             raise QwenError(f"连接百炼失败（{type(exc).__name__}）") from exc
         text = "".join(chunks).strip()

@@ -328,3 +328,29 @@ def test_segment_returns_only_that_time_range(tmp_path, monkeypatch):
             await watcher2.segment(BVID, 0, 60)
 
     run_with_world(test)
+
+
+def test_slow_model_is_not_cut_off_by_the_session_read_limit(tmp_path, monkeypatch):
+    """真机：会话默认「60 秒没数据就断」比模型超时短，百炼还在看视频就被切断了。"""
+
+    async def main():
+        world = FakeWorld()
+        server = await start(world)
+        monkeypatch.setitem(qwen_module.REGIONS, "beijing", world.base)
+        # 会话默认 0.2 秒没数据就断（相当于插件里的 60 秒），模型 0.5 秒后才开始回
+        session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None, sock_read=0.2))
+        try:
+            world.qwen_delay = 0.5
+            video = tmp_path / "v.mp4"
+            video.write_bytes(b"\x00" * 100)
+            qwen = QwenClient(session, QwenSettings(api_key="k", model_timeout=5))
+            assert "猫" in await qwen.describe(video, "描述")
+            # 超过模型超时：说清楚是等太久，而不是连不上
+            slow = QwenClient(session, QwenSettings(api_key="k", model_timeout=0.2))
+            with pytest.raises(QwenError, match="没有回音|超过"):
+                await slow.describe(video, "描述")
+        finally:
+            await session.close()
+            await server.close()
+
+    asyncio.run(main())
