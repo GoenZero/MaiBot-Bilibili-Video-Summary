@@ -290,8 +290,8 @@ class RequestBody(aiohttp.payload.Payload):
             return
         self._logged = True
         elapsed = max(self.finished_at - self.started_at, 0.001)
-        spent = "不到 1 秒" if elapsed < 1 else f"{elapsed:.0f} 秒"
-        client.last_upload = f"直接发送 {_mb(self.size)} 用了 {spent}（约 {_mb(self.size / elapsed)}/秒）"
+        spent = "用了不到 1 秒" if elapsed < 1 else f"用了 {elapsed:.0f} 秒"
+        client.last_upload = f"直接发送 {_mb(self.size)} {spent}（约 {_mb(self.size / elapsed)}/秒）"
         client.log.info("B站视频：视频已发给%s，%s；等模型看完", client.name, client.last_upload)
 
 
