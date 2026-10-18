@@ -3,7 +3,7 @@
   "id": "com.goenzero.bilibili_video",
   "version": "0.1.0",
   "name": "B站视频 / Bilibili Video",
-  "description": "让 AI 能看 B 站视频：短视频交给阿里百炼千问 Omni 看画面和声音，长视频读字幕，并附上标题、简介和热门弹幕。",
+  "description": "让 AI 能看 B 站视频：短视频交给阿里百炼千问 Omni 或 Google Gemini 看画面和声音，长视频读字幕，并附上标题、简介和热门弹幕。",
   "author": {
     "name": "GoenZero",
     "url": "https://github.com/GoenZero"

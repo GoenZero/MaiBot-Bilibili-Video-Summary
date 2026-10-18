@@ -7,7 +7,7 @@ from typing import ClassVar, Literal
 from maibot_sdk import Field, PluginConfigBase
 
 # 配置结构有增减时提升版本：MaiBot 只在版本升高时把新字段写回已有的 config.toml
-SUPPORTED_CONFIG_VERSION = "1.0.0"
+SUPPORTED_CONFIG_VERSION = "1.1.0"
 PLUGIN_VERSION = "0.1.0"
 
 
@@ -46,36 +46,62 @@ class BilibiliConfig(PluginConfigBase):
 
 
 class QwenConfig(PluginConfigBase):
-    __ui_label__: ClassVar[str] = "看视频的模型（阿里百炼）"
+    __ui_label__: ClassVar[str] = "看视频的模型"
     __ui_order__: ClassVar[int] = 2
 
+    provider: Literal["百炼", "Gemini"] = Field(
+        default="百炼",
+        description="短视频交给谁看画面和声音。选 Gemini 时在下面「Gemini」分组里填它的 Key。从国外连北京的百炼上传很慢时，可以换 Gemini。",
+        json_schema_extra={"label": "用哪家的模型", "order": 0},
+    )
     api_key: str = Field(
         default="",
-        description="阿里百炼的 API Key。不填就只读字幕和简介，不看画面。",
-        json_schema_extra={"label": "API Key", "input_type": "password", "placeholder": "sk-...", "order": 0},
+        description="阿里百炼的 API Key。选了百炼却不填，就只读字幕和简介，不看画面。",
+        json_schema_extra={"label": "百炼 API Key", "input_type": "password", "placeholder": "sk-...", "order": 1},
     )
     region: Literal["beijing", "singapore"] = Field(
         default="beijing",
-        description="API Key 所属的地域：中国大陆（北京）或国际（新加坡）。两边的 Key 不通用。",
-        json_schema_extra={"label": "地域", "order": 1},
+        description="百炼 API Key 所属的地域：中国大陆（北京）或国际（新加坡）。两边的 Key 不通用。",
+        json_schema_extra={"label": "百炼地域", "order": 2},
     )
     model: str = Field(
         default="qwen3.5-omni-plus",
         description="能同时看画面、听声音的千问 Omni 模型名。",
-        json_schema_extra={"label": "模型", "placeholder": "qwen3.5-omni-plus", "order": 2},
+        json_schema_extra={"label": "百炼模型", "placeholder": "qwen3.5-omni-plus", "order": 3},
     )
     fps: float = Field(
         default=1.0,
         ge=0.5,
         le=2.0,
-        description="每秒看几帧画面。越高越细，也越贵越慢。",
-        json_schema_extra={"label": "每秒帧数", "x-widget": "slider", "step": 0.5, "order": 3},
+        description="每秒看几帧画面（百炼和 Gemini 都用这个）。越高越细，也越贵越慢。",
+        json_schema_extra={"label": "每秒帧数", "x-widget": "slider", "step": 0.5, "order": 4},
+    )
+
+
+class GeminiConfig(PluginConfigBase):
+    __ui_label__: ClassVar[str] = "Gemini"
+    __ui_order__: ClassVar[int] = 3
+
+    api_key: str = Field(
+        default="",
+        description="Google AI Studio 的 Gemini API Key。只有「用哪家的模型」选了 Gemini 才用。",
+        json_schema_extra={"label": "Gemini API Key", "input_type": "password", "placeholder": "AIza...", "order": 0},
+    )
+    model: str = Field(
+        default="gemini-3.5-flash",
+        description="Gemini 的模型名。",
+        json_schema_extra={"label": "Gemini 模型", "placeholder": "gemini-3.5-flash", "order": 1},
+    )
+    resolution: Literal["低", "标准"] = Field(
+        default="低",
+        description="每帧画面看多细。「低」更省钱，一般看懂发生了什么够用；画面上的小字看不清时选「标准」（大约贵三倍）。",
+        json_schema_extra={"label": "画面细节", "order": 2},
     )
 
 
 class WatchConfig(PluginConfigBase):
     __ui_label__: ClassVar[str] = "看视频"
-    __ui_order__: ClassVar[int] = 3
+    __ui_order__: ClassVar[int] = 4
 
     short_minutes: int = Field(
         default=5,
@@ -124,14 +150,14 @@ class WatchConfig(PluginConfigBase):
         default=300,
         ge=30,
         le=900,
-        description="把视频发给百炼（直接放进请求或传到临时空间）最多等多少秒。从国外连北京的百炼会比较慢。",
+        description="把视频发给模型（直接放进请求或先上传）最多等多少秒。从国外连北京的百炼会很慢。",
         json_schema_extra={"label": "上传超时（秒）", "order": 7},
     )
     model_timeout: int = Field(
         default=300,
         ge=30,
         le=600,
-        description="视频发过去以后，百炼看视频最多等多少秒（不含下载和发送）。几分钟的视频，模型可能要想两三分钟。",
+        description="视频发过去以后，模型看视频最多等多少秒（不含下载和发送）。几分钟的视频，模型可能要想两三分钟。",
         json_schema_extra={"label": "模型超时（秒）", "order": 8},
     )
 
@@ -140,4 +166,5 @@ class BilibiliVideoConfig(PluginConfigBase):
     plugin: PluginOptions = Field(default_factory=PluginOptions)
     bilibili: BilibiliConfig = Field(default_factory=BilibiliConfig)
     qwen: QwenConfig = Field(default_factory=QwenConfig)
+    gemini: GeminiConfig = Field(default_factory=GeminiConfig)
     watch: WatchConfig = Field(default_factory=WatchConfig)

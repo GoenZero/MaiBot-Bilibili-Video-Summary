@@ -1,6 +1,6 @@
 """MaiBot B 站视频插件：让 AI 能「看」B 站视频。
 
-短视频交给阿里百炼的千问 Omni 看画面和声音；长视频读字幕；都附上标题、简介和热门弹幕。
+短视频交给阿里百炼的千问 Omni 或 Google Gemini 看画面和声音；长视频读字幕；都附上标题、简介和热门弹幕。
 AI 用 bilibili_watch 工具决定看不看；收到链接时插件先在后台看起来，省得干等。
 """
 
@@ -19,6 +19,7 @@ from .config import PLUGIN_VERSION, BilibiliVideoConfig
 from .core.bilibili import BiliClient, BiliError, parse_time
 from .core.cache import ResultCache
 from .core.links import find_links
+from .core.gemini import GeminiClient, GeminiSettings
 from .core.qwen import QwenClient, QwenSettings
 from .core.watcher import WatchSettings, Watcher
 
@@ -87,9 +88,23 @@ class BilibiliVideoPlugin(MaiBotPlugin):
             timeout=aiohttp.ClientTimeout(total=None, sock_connect=20, sock_read=60),
         )
         bili = BiliClient(self._session, cfg.bilibili.cookie, logger=self.ctx.logger)
-        qwen = None
-        if cfg.qwen.api_key.strip():
-            qwen = QwenClient(
+        viewer: Optional[Any] = None
+        if cfg.qwen.provider == "Gemini":
+            if cfg.gemini.api_key.strip():
+                viewer = GeminiClient(
+                    self._session,
+                    GeminiSettings(
+                        api_key=cfg.gemini.api_key.strip(),
+                        model=cfg.gemini.model.strip() or "gemini-3.5-flash",
+                        fps=cfg.qwen.fps,
+                        resolution=cfg.gemini.resolution,
+                        upload_timeout=float(cfg.watch.upload_timeout),
+                        model_timeout=float(cfg.watch.model_timeout),
+                    ),
+                    logger=self.ctx.logger,
+                )
+        elif cfg.qwen.api_key.strip():
+            viewer = QwenClient(
                 self._session,
                 QwenSettings(
                     api_key=cfg.qwen.api_key.strip(),
@@ -112,7 +127,7 @@ class BilibiliVideoPlugin(MaiBotPlugin):
         assert self._cache is not None
         self._watcher = Watcher(
             bili,
-            qwen,
+            viewer,
             self._cache,
             settings,
             Path(self.ctx.paths.data_dir) / "tmp",
@@ -232,12 +247,17 @@ class BilibiliVideoPlugin(MaiBotPlugin):
                 lines.append(f"B 站登录：查不到（{exc}）")
         else:
             lines.append("B 站登录：未填写（读不到 AI 字幕）")
-        lines.append(f"看画面的模型：{cfg.qwen.model}（{'北京' if cfg.qwen.region == 'beijing' else '新加坡'}）" if cfg.qwen.api_key.strip() else "看画面的模型：未填写百炼 API Key（只读字幕和简介）")
+        if cfg.qwen.provider == "Gemini":
+            model_line = f"Gemini {cfg.gemini.model}（画面细节：{cfg.gemini.resolution}）" if cfg.gemini.api_key.strip() else "未填写 Gemini API Key（只读字幕和简介）"
+        else:
+            region = "北京" if cfg.qwen.region == "beijing" else "新加坡"
+            model_line = f"百炼 {cfg.qwen.model}（{region}）" if cfg.qwen.api_key.strip() else "未填写百炼 API Key（只读字幕和简介）"
+        lines.append(f"看画面的模型：{model_line}")
         lines.append(f"看画面的时长上限：{cfg.watch.short_minutes} 分钟")
         if watcher is not None and watcher.last_download:
             lines.append(f"最近一次下载视频：{watcher.last_download}")
-        if watcher is not None and watcher.qwen is not None and watcher.qwen.last_upload:
-            lines.append(f"最近一次把视频发给百炼：{watcher.qwen.last_upload}")
+        if watcher is not None and watcher.viewer is not None and watcher.viewer.last_upload:
+            lines.append(f"最近一次把视频发给{watcher.viewer.name}：{watcher.viewer.last_upload}")
         lines.append(f"已缓存：{len(self._cache) if self._cache else 0} 条")
         if watcher is not None and watcher.bili.blocked_seconds:
             lines.append(f"⚠️ 刚被 B 站风控拦过，{watcher.bili.blocked_seconds} 秒内暂停请求")

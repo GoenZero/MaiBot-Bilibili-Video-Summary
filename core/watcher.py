@@ -1,6 +1,6 @@
 """「看」一个 B 站视频：整理成一段交给 AI 的文字。
 
-- 短视频（默认 5 分钟以内）且填了百炼 API Key：下载低清晰度版本，交给千问 Omni 看画面和声音。
+- 短视频（默认 5 分钟以内）且配置了看视频的模型（百炼或 Gemini）：下载低清晰度版本，交给模型看画面和声音。
 - 长视频，或者看画面失败：读字幕；字幕太长时用 MaiBot 里配置的文本模型压缩。
 - 都附上标题、UP 主、简介和热门弹幕。
 
@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Awaitable, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Awaitable, Callable, Dict, List, Optional, Union
 
 import asyncio
 import logging
@@ -22,7 +22,11 @@ import time
 from .bilibili import BiliClient, BiliError, Chapter, MediaPlan, VideoInfo, format_chapters, format_seconds, line_seconds
 from .links import VideoRef
 from .cache import ResultCache
-from .qwen import QwenClient, QwenError, _mb, build_video_prompt
+from .qwen import ModelError, _mb, build_video_prompt
+
+if TYPE_CHECKING:
+    from .gemini import GeminiClient
+    from .qwen import QwenClient
 
 # (字幕全文, 字数上限, 分段说明) → 摘要；没有分段时分段说明为空字符串
 Summarizer = Callable[[str, int, str], Awaitable[str]]
@@ -45,7 +49,7 @@ class Watcher:
     def __init__(
         self,
         bili: BiliClient,
-        qwen: Optional[QwenClient],
+        viewer: Optional[Union["QwenClient", "GeminiClient"]],
         cache: ResultCache,
         settings: WatchSettings,
         temp_root: Path,
@@ -53,7 +57,7 @@ class Watcher:
         logger: Optional[logging.Logger] = None,
     ) -> None:
         self.bili = bili
-        self.qwen = qwen
+        self.viewer = viewer  # 看画面的模型
         self.cache = cache
         self.settings = settings
         self.temp_root = temp_root
@@ -159,14 +163,14 @@ class Watcher:
         danmaku = await self.bili.hot_danmaku(info.cid) if self.settings.danmaku else []
 
         video_text: Optional[str] = None
-        wants_video = self.qwen is not None and info.duration <= self.settings.short_seconds
+        wants_video = self.viewer is not None and info.duration <= self.settings.short_seconds
         if wants_video:
             try:
                 video_text = await self._watch_video(info)
-            except (BiliError, QwenError) as exc:
+            except (BiliError, ModelError) as exc:
                 self.log.warning("B站视频：没能看画面（%s）：%s %s", info.bvid, exc, getattr(exc, "detail", ""))
                 notes.append(f"这次没能看到画面：{exc}")
-        elif self.qwen is None:
+        elif self.viewer is None:
             notes.append("没有配置看视频的模型，只读了字幕和简介")
         else:
             notes.append(f"视频较长（{format_seconds(info.duration)}），没有看画面，只读了字幕")
@@ -187,7 +191,7 @@ class Watcher:
         return f"{CACHE_VERSION}:{ref.key}" + (f":{kind}" if kind else "")
 
     async def _watch_video(self, info: VideoInfo) -> str:
-        assert self.qwen is not None
+        assert self.viewer is not None
         cfg = self.settings
         async with self._heavy:
             plan = await self._choose_plan(info)
@@ -210,16 +214,16 @@ class Watcher:
                 prompt = build_video_prompt(
                     info.title, info.owner, format_seconds(info.duration), info.description, max(300, cfg.max_chars - 400)
                 )
-                return await self.qwen.describe(video_path, prompt, audio_path)
+                return await self.viewer.describe(video_path, prompt, audio_path)
             finally:
                 shutil.rmtree(workdir, ignore_errors=True)
 
     async def _choose_plan(self, info: VideoInfo) -> MediaPlan:
-        """带声音的 mp4 太大、只能先传到百炼临时空间时，看看分开的画面和声音能不能都直接放进请求里。
+        """带声音的 mp4 太大、只能先传到模型的临时空间时，看看分开的画面和声音能不能都直接放进请求里。
         真机发现：从日本往北京的临时空间上传极慢（8.5MB 传了 300 秒还没完），直接放进请求里则快得多。"""
-        assert self.qwen is not None
+        assert self.viewer is not None
         plan = await self.bili.media_plan(info, self.settings.quality)
-        limit = self.qwen.inline_limit
+        limit, total = self.viewer.inline_limit, self.viewer.inline_total
         if plan.audio_url or plan.size_hint <= limit:
             return plan
         try:
@@ -227,7 +231,8 @@ class Watcher:
         except BiliError as exc:
             self.log.info("B站视频：没拿到分开的画面和声音（%s），照常上传：%s", info.bvid, exc)
             return plan
-        if separate.audio_url and 0 < separate.size_hint <= limit and separate.audio_size_hint <= limit:
+        sizes = (separate.size_hint, separate.audio_size_hint)
+        if separate.audio_url and 0 < sizes[0] <= limit and sizes[1] <= limit and sum(sizes) <= total:
             self.log.info(
                 "B站视频：合并的视频约 %s，要传到临时空间；改用分开的画面（约 %s）和声音（约 %s），直接发给模型",
                 _mb(plan.size_hint), _mb(separate.size_hint), _mb(separate.audio_size_hint),

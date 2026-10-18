@@ -13,6 +13,7 @@ from maibot_sdk.context import PluginContext, PluginPaths
 import bili_video_under_test as plugin_module
 from bili_video_under_test.core import qwen as qwen_module
 from bili_video_under_test.core.bilibili import BiliClient
+from bili_video_under_test.core.gemini import GeminiClient
 
 from fake_servers import BVID, FakeWorld, start
 
@@ -73,7 +74,7 @@ def test_prefetch_then_tool_returns_the_same_result(tmp_path, monkeypatch):
 
     async def test(world):
         await plugin.on_load()
-        assert plugin._watcher.qwen.settings.upload_timeout == 300  # 默认放宽到 300 秒，可在 WebUI 调
+        assert plugin._watcher.viewer.settings.upload_timeout == 300  # 默认放宽到 300 秒，可在 WebUI 调
         message = {"raw_message": [{"type": "text", "data": f"[链接] https://www.bilibili.com/video/{BVID}"}]}
         await plugin.on_inbound(message=message)
         result = await plugin.tool_watch(url=f"看看这个 https://www.bilibili.com/video/{BVID}", stream_id="s1")
@@ -168,6 +169,28 @@ def test_tool_reads_a_time_range(tmp_path, monkeypatch):
         assert "10:00–15:00" in only_start["content"]
         bad = await plugin.tool_watch(url=BVID, start="半路")
         assert bad["success"] is False and "格式" in bad["error"]
+        await plugin.on_unload()
+
+    with_world(monkeypatch, test)
+
+
+def test_gemini_can_be_chosen_in_webui(tmp_path, monkeypatch):
+    host = FakeHost()
+    data = copy.deepcopy(CONFIG)
+    data["qwen"]["provider"] = "Gemini"
+    data["gemini"] = {"api_key": "AIza-topsecret", "model": "gemini-3.5-flash", "resolution": "标准"}
+    plugin = make_plugin(tmp_path, host, data)
+
+    async def test(world):
+        monkeypatch.setattr(GeminiClient, "API", world.base)
+        await plugin.on_load()
+        result = await plugin.tool_watch(url=BVID)
+        assert result["success"] is True and "笑点是它摔了下来" in result["content"]
+        assert world.qwen_payloads == [] and len(world.gemini_payloads) == 1
+        assert world.gemini_payloads[0]["generationConfig"]["mediaResolution"] == "MEDIA_RESOLUTION_MEDIUM"
+        await plugin.handle_status(stream_id="s1")
+        status = host.sent_texts()[-1]["text"]
+        assert "Gemini gemini-3.5-flash" in status and "topsecret" not in status
         await plugin.on_unload()
 
     with_world(monkeypatch, test)

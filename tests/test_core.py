@@ -13,6 +13,8 @@ from bili_video_under_test.core import qwen as qwen_module
 from bili_video_under_test.core.bilibili import BiliClient, BiliError, line_seconds, mixin_key, parse_cookie, parse_time, sign_wbi
 from bili_video_under_test.core.cache import ResultCache
 from bili_video_under_test.core.links import VideoRef, find_links, parse_video_url, ref_from_text
+from bili_video_under_test.core import gemini as gemini_module
+from bili_video_under_test.core.gemini import GeminiClient, GeminiError, GeminiSettings
 from bili_video_under_test.core.qwen import QwenClient, QwenError, QwenSettings
 from bili_video_under_test.core.watcher import WatchSettings, Watcher
 
@@ -548,5 +550,72 @@ def test_inline_request_reports_send_time_and_blames_the_right_step(tmp_path, mo
         qwen.settings.model_timeout = 0.3
         with pytest.raises(QwenError, match="视频已经发过去了，是模型那边慢"):
             await qwen.describe(video, "描述")
+
+    run_with_world(test)
+
+
+
+def gemini_for(world: FakeWorld, session, monkeypatch, **overrides) -> GeminiClient:
+    monkeypatch.setattr(GeminiClient, "API", world.base)
+    monkeypatch.setattr(GeminiClient, "POLL_SECONDS", 0.01)
+    return GeminiClient(session, GeminiSettings(api_key="AIza-secret", **overrides))
+
+
+def test_gemini_watches_a_short_video_inline(tmp_path, monkeypatch):
+    async def test(world, session):
+        gemini = gemini_for(world, session, monkeypatch)
+        watcher = Watcher(client_for(world, session), gemini, ResultCache(tmp_path / "c.json"), WatchSettings(), tmp_path / "tmp")
+        text = await watcher.watch(BVID)
+        assert "笑点是它摔了下来" in text and "先想想" not in text  # 模型的「思考」不交给 AI
+        payload = world.gemini_payloads[-1]
+        assert payload["path"] == "/v1beta/models/gemini-3.5-flash:generateContent"
+        video_part = payload["contents"][0]["parts"][0]
+        assert video_part["inlineData"]["mimeType"] == "video/mp4" and video_part["videoMetadata"] == {"fps": 1.0}
+        assert payload["generationConfig"]["mediaResolution"] == "MEDIA_RESOLUTION_LOW"
+        assert world.gemini_headers[-1]["x-goog-api-key"] == "AIza-secret"
+        assert "AIza-secret" not in json.dumps(payload) and world.qwen_payloads == [] and world.gemini_uploads == []
+
+    run_with_world(test)
+
+
+def test_gemini_uploads_large_files_waits_until_ready_and_deletes_them(tmp_path, monkeypatch):
+    async def test(world, session):
+        monkeypatch.setattr(gemini_module, "REQUEST_LIMIT", 70000)  # 让 2000 多字节的视频也走上传
+        gemini = gemini_for(world, session, monkeypatch)
+        video = tmp_path / "BV1xx.mp4"
+        video.write_bytes(b"\x01" * 5000)
+        assert "猫" in await gemini.describe(video, "描述")
+        assert world.gemini_uploads[-1]["size"] == 5000 and world.gemini_uploads[-1]["mime"] == "video/mp4"
+        assert world.gemini_polls == 2  # 等到 ACTIVE 才交给模型
+        part = world.gemini_payloads[-1]["contents"][0]["parts"][0]
+        assert part["fileData"]["fileUri"].endswith("/v1beta/files/abc")
+        assert world.gemini_deleted == ["abc"] and gemini.last_upload.startswith("上传 5KB 用了")
+
+    run_with_world(test)
+
+
+def test_gemini_errors_are_explained(tmp_path, monkeypatch):
+    async def test(world, session):
+        gemini = gemini_for(world, session, monkeypatch)
+        video = tmp_path / "v.mp4"
+        video.write_bytes(b"\x01" * 100)
+        world.gemini_status = 400
+        with pytest.raises(GeminiError, match="HTTP 400.*API key not valid"):
+            await gemini.describe(video, "描述")
+        world.gemini_status = 200
+        world.gemini_reply = {"promptFeedback": {"blockReason": "SAFETY"}}
+        with pytest.raises(GeminiError, match="拒绝了这个视频（SAFETY）"):
+            await gemini.describe(video, "描述")
+        world.gemini_reply = {"candidates": [{"content": {"parts": [{"text": "想", "thought": True}]}, "finishReason": "MAX_TOKENS"}]}
+        with pytest.raises(GeminiError, match="MAX_TOKENS"):
+            await gemini.describe(video, "描述")
+        world.gemini_reply = {"candidates": [{"content": {"parts": [{"text": "好"}]}}]}
+        world.gemini_delay = 2
+        gemini.settings.upload_timeout = gemini.settings.model_timeout = 0.3
+        with pytest.raises(GeminiError, match="是模型那边慢"):
+            await gemini.describe(video, "描述")
+        assert gemini_module.is_trusted_google_url("https://generativelanguage.googleapis.com/upload?x=1", "https://generativelanguage.googleapis.com")
+        assert not gemini_module.is_trusted_google_url("https://evil.example.com/upload", "https://generativelanguage.googleapis.com")
+        assert not gemini_module.is_trusted_google_url("http://x.googleapis.com/u", "https://generativelanguage.googleapis.com")
 
     run_with_world(test)

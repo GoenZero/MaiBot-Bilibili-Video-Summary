@@ -36,8 +36,12 @@ SYSTEM_PROMPT = (
 )
 
 
-class QwenError(Exception):
-    """给人和 AI 看的错误说明（不含密钥）。"""
+class ModelError(Exception):
+    """看视频的模型（百炼或 Gemini）出的错：给人和 AI 看的说明（不含密钥）。"""
+
+
+class QwenError(ModelError):
+    """百炼出的错。"""
 
 
 @dataclass
@@ -70,6 +74,8 @@ def build_video_prompt(title: str, owner: str, duration: str, description: str, 
 
 
 class QwenClient:
+    name = "百炼"
+
     def __init__(self, session: aiohttp.ClientSession, settings: QwenSettings, logger: Optional[Any] = None) -> None:
         self._session = session
         self.settings = settings
@@ -81,6 +87,11 @@ class QwenClient:
     def inline_limit(self) -> int:
         """多大以内的文件可以直接放进请求里（不用先传到临时空间）。"""
         return (DATA_URL_LIMIT - 64) * 3 // 4
+
+    @property
+    def inline_total(self) -> int:
+        """分开的画面和声音合起来多大以内可以都直接放进请求里（百炼按单个文件限制）。"""
+        return 2 * self.inline_limit
 
     async def describe(self, video: Path, prompt: str, audio: Optional[Path] = None) -> str:
         cfg = self.settings
@@ -273,14 +284,14 @@ class RequestBody(aiohttp.payload.Payload):
             self.sent += len(piece)
         self.finished_at = time.monotonic()
 
-    def log_sent(self, client: "QwenClient") -> None:
+    def log_sent(self, client: Any) -> None:
         """请求发完后写一行日志（大请求才写，只写一次）；/bili_status 也能看到。"""
         if self._logged or self.finished_at is None or self.size < 1048576:
             return
         self._logged = True
         elapsed = max(self.finished_at - self.started_at, 0.001)
         client.last_upload = f"直接发送 {_mb(self.size)} 用了 {elapsed:.0f} 秒（约 {_mb(self.size / elapsed)}/秒）"
-        client.log.info("B站视频：视频已发给百炼，%s；等模型看完", client.last_upload)
+        client.log.info("B站视频：视频已发给%s，%s；等模型看完", client.name, client.last_upload)
 
 
 class OssFormPayload(aiohttp.payload.Payload):

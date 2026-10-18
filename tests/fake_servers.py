@@ -54,6 +54,22 @@ class FakeWorld:
         self.view_hits = 0
         self.player_hits = 0
         self.cookies_seen: List[str] = []
+        # 假 Gemini
+        self.gemini_payloads: List[Dict[str, Any]] = []
+        self.gemini_headers: List[Dict[str, str]] = []
+        self.gemini_status = 200
+        self.gemini_delay = 0.0
+        self.gemini_reply: Dict[str, Any] = {
+            "candidates": [
+                {
+                    "content": {"parts": [{"text": "先想想", "thought": True}, {"text": "画面里一只猫跳上了桌子，笑点是它摔了下来。"}]},
+                    "finishReason": "STOP",
+                }
+            ]
+        }
+        self.gemini_uploads: List[Dict[str, Any]] = []
+        self.gemini_polls = 0
+        self.gemini_deleted: List[str] = []
 
     def check_signature(self, request: web.Request) -> None:
         params = dict(request.query)
@@ -78,6 +94,11 @@ class FakeWorld:
         app.router.add_get("/api/v1/uploads", self.upload_policy)
         app.router.add_post("/compatible-mode/v1/chat/completions", self.chat)
         app.router.add_post("/oss", self.oss_upload)
+        app.router.add_post("/v1beta/models/{tail}", self.gemini_generate)
+        app.router.add_post("/upload/v1beta/files", self.gemini_upload_start)
+        app.router.add_post("/upload-session/1", self.gemini_upload_bytes)
+        app.router.add_get("/v1beta/files/{name}", self.gemini_file)
+        app.router.add_delete("/v1beta/files/{name}", self.gemini_delete)
         return app
 
     async def nav(self, request: web.Request) -> web.Response:
@@ -249,6 +270,42 @@ class FakeWorld:
             await asyncio.sleep(self.oss_delay)
         self.oss_uploads.append({"fields": fields, "size": file_size})
         return web.Response(status=200)
+
+    async def gemini_generate(self, request: web.Request) -> web.Response:
+        self.gemini_headers.append(dict(request.headers))
+        self.gemini_payloads.append({"path": request.path, **(await request.json())})
+        if self.gemini_status != 200:
+            return web.json_response({"error": {"message": "API key not valid"}}, status=self.gemini_status)
+        if self.gemini_delay:
+            await asyncio.sleep(self.gemini_delay)
+        return web.json_response(self.gemini_reply)
+
+    async def gemini_upload_start(self, request: web.Request) -> web.Response:
+        h = request.headers
+        if h.get("X-Goog-Upload-Protocol") != "resumable" or h.get("X-Goog-Upload-Command") != "start":
+            return web.json_response({"error": {"message": "bad start"}}, status=400)
+        self.gemini_uploads.append(
+            {"length": int(h["X-Goog-Upload-Header-Content-Length"]), "mime": h["X-Goog-Upload-Header-Content-Type"], "meta": await request.json()}
+        )
+        return web.Response(headers={"X-Goog-Upload-URL": f"{self.base}/upload-session/1"})
+
+    async def gemini_upload_bytes(self, request: web.Request) -> web.Response:
+        if request.headers.get("X-Goog-Upload-Command") != "upload, finalize" or request.headers.get("X-Goog-Upload-Offset") != "0":
+            return web.json_response({"error": {"message": "bad upload"}}, status=400)
+        data = await request.read()
+        if len(data) != self.gemini_uploads[-1]["length"]:
+            return web.json_response({"error": {"message": "length mismatch"}}, status=400)
+        self.gemini_uploads[-1]["size"] = len(data)
+        return web.json_response({"file": {"name": "files/abc", "uri": f"{self.base}/v1beta/files/abc", "state": "PROCESSING"}})
+
+    async def gemini_file(self, request: web.Request) -> web.Response:
+        self.gemini_polls += 1
+        state = "ACTIVE" if self.gemini_polls >= 2 else "PROCESSING"
+        return web.json_response({"name": "files/abc", "uri": f"{self.base}/v1beta/files/abc", "state": state})
+
+    async def gemini_delete(self, request: web.Request) -> web.Response:
+        self.gemini_deleted.append(request.match_info["name"])
+        return web.json_response({})
 
     async def chat(self, request: web.Request) -> web.StreamResponse:
         self.qwen_headers.append(dict(request.headers))
