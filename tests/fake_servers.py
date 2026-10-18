@@ -31,7 +31,9 @@ class FakeWorld:
             {"type": 2, "from": 65, "to": 120, "content": "开始  做饭", "imgUrl": "x"},
             {"type": 2, "from": 0, "to": 65, "content": "开场", "imgUrl": "x"},
         ]
-        self.playurl_mode = "durl"
+        self.playurl_mode = "durl"  # durl：只有合并的 mp4；dash：只有分开的；both：两种都有
+        self.durl_size = 0  # 合并 mp4 报的大小，0 表示和实际下载的一样
+        self.oss_delay = 0.0  # 收完文件后多久才回应
         self.bad_signatures = 0
         self.qwen_payloads: List[Dict[str, Any]] = []
         self.qwen_reply = ["画面里一只猫", "跳上了桌子，笑点是它摔了下来。"]
@@ -130,9 +132,10 @@ class FakeWorld:
         self.check_signature(request)
         if self.block_playurl:
             return web.Response(status=412, text="blocked")
-        if self.playurl_mode == "durl" and request.query.get("fnval") == "1":
-            return web.json_response({"code": 0, "data": {"durl": [{"url": f"{self.base}/media/v.mp4", "size": self.video_size}]}})
-        if self.playurl_mode == "dash" and request.query.get("fnval") == "4048":
+        if self.playurl_mode in ("durl", "both") and request.query.get("fnval") == "1":
+            size = self.durl_size or self.video_size
+            return web.json_response({"code": 0, "data": {"durl": [{"url": f"{self.base}/media/v.mp4", "size": size}]}})
+        if self.playurl_mode in ("dash", "both") and request.query.get("fnval") == "4048":
             return web.json_response(
                 {
                     "code": 0,
@@ -242,6 +245,8 @@ class FakeWorld:
                 fields[part.name or ""] = (await part.read()).decode()
         if file_size < 0 or not fields.get("key", "").startswith("dashscope-instant/abc/"):
             return error("InvalidArgument", "missing file or key")
+        if self.oss_delay:
+            await asyncio.sleep(self.oss_delay)
         self.oss_uploads.append({"fields": fields, "size": file_size})
         return web.Response(status=200)
 

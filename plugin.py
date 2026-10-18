@@ -234,6 +234,10 @@ class BilibiliVideoPlugin(MaiBotPlugin):
             lines.append("B 站登录：未填写（读不到 AI 字幕）")
         lines.append(f"看画面的模型：{cfg.qwen.model}（{'北京' if cfg.qwen.region == 'beijing' else '新加坡'}）" if cfg.qwen.api_key.strip() else "看画面的模型：未填写百炼 API Key（只读字幕和简介）")
         lines.append(f"看画面的时长上限：{cfg.watch.short_minutes} 分钟")
+        if watcher is not None and watcher.last_download:
+            lines.append(f"最近一次下载视频：{watcher.last_download}")
+        if watcher is not None and watcher.qwen is not None and watcher.qwen.last_upload:
+            lines.append(f"最近一次上传到百炼临时空间：{watcher.qwen.last_upload}")
         lines.append(f"已缓存：{len(self._cache) if self._cache else 0} 条")
         if watcher is not None and watcher.bili.blocked_seconds:
             lines.append(f"⚠️ 刚被 B 站风控拦过，{watcher.bili.blocked_seconds} 秒内暂停请求")

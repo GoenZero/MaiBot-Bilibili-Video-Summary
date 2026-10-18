@@ -485,7 +485,49 @@ def test_slow_upload_reports_size_and_speed_is_logged(tmp_path, monkeypatch):
 
         monkeypatch.setattr(qwen, "_upload", stuck)
         qwen.settings.upload_timeout = 0.1
-        with pytest.raises(QwenError, match=r"超过 0 秒（视频约 3.0MB，网络上传太慢）"):
+        with pytest.raises(QwenError, match=r"超过 0 秒（视频约 3.0MB，还没开始传文件）"):
             await qwen.describe(video, "描述")
+        monkeypatch.undo()
+        monkeypatch.setitem(qwen_module.REGIONS, "beijing", world.base)
+        monkeypatch.setattr(qwen_module, "is_trusted_upload_host", lambda url: url.startswith(world.base))
+        monkeypatch.setattr(qwen_module, "DATA_URL_LIMIT", 100)
+
+        # 文件都发出去了，阿里云却迟迟不回应：说清楚不是网络慢
+        world.oss_delay = 2
+        qwen.settings.upload_timeout = 0.5
+        with pytest.raises(QwenError, match="3.0MB 已经全部传出，但阿里云一直没回应"):
+            await qwen.describe(video, "描述")
+        assert "超时" in qwen.last_upload
 
     run_with_world(test)
+
+
+def test_big_combined_video_switches_to_separate_streams_sent_inline(tmp_path, monkeypatch):
+    """真机：合并的 mp4 太大要传到百炼临时空间，从日本传极慢；分开的画面和声音都够小，就直接放进请求里。"""
+
+    async def test(world, session):
+        monkeypatch.setattr(qwen_module, "DATA_URL_LIMIT", 2_000_000)
+        world.playurl_mode = "both"
+        world.durl_size = 3_000_000
+        watcher = make_watcher(world, session, monkeypatch, tmp_path)
+        assert "笑点是它摔了下来" in await watcher.watch(BVID)
+        content = world.qwen_payloads[-1]["messages"][1]["content"]
+        assert content[0]["video_url"]["url"].startswith("data:video/mp4;base64,")
+        assert content[1]["input_audio"]["data"].startswith("data:audio/mp4;base64,")
+        assert world.oss_uploads == [] and watcher.last_download
+
+    run_with_world(test)
+
+
+def test_separate_streams_estimate_size_from_bitrate():
+    data = {
+        "durl": [{"url": "http://x/combined.mp4", "size": 9_000_000}],
+        "dash": {
+            "duration": 240,
+            "video": [{"id": 16, "codecid": 7, "bandwidth": 200_000, "baseUrl": "http://x/v"}],
+            "audio": [{"bandwidth": 64_000, "baseUrl": "http://x/a"}],
+        },
+    }
+    assert bili_module._plan_from_play(data, 16).video_url == "http://x/combined.mp4"
+    plan = bili_module._plan_from_play(data, 16, separate=True)
+    assert (plan.video_url, plan.size_hint, plan.audio_size_hint) == ("http://x/v", 6_000_000, 1_920_000)

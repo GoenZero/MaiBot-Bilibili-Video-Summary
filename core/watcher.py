@@ -19,7 +19,7 @@ import shutil
 import tempfile
 import time
 
-from .bilibili import BiliClient, BiliError, Chapter, VideoInfo, format_chapters, format_seconds, line_seconds
+from .bilibili import BiliClient, BiliError, Chapter, MediaPlan, VideoInfo, format_chapters, format_seconds, line_seconds
 from .links import VideoRef
 from .cache import ResultCache
 from .qwen import QwenClient, QwenError, _mb, build_video_prompt
@@ -59,6 +59,7 @@ class Watcher:
         self.temp_root = temp_root
         self.summarize = summarize
         self.log = logger or logging.getLogger(__name__)
+        self.last_download = ""  # 最近一次下载的情况，给 /bili_status 看
         self._tasks: Dict[str, "asyncio.Task[str]"] = {}
         # 同一个视频（短链接和完整链接可能指向同一个）同时只处理一次
         self._by_video: Dict[str, "asyncio.Task[str]"] = {}
@@ -189,7 +190,7 @@ class Watcher:
         assert self.qwen is not None
         cfg = self.settings
         async with self._heavy:
-            plan = await self.bili.media_plan(info, cfg.quality)
+            plan = await self._choose_plan(info)
             if plan.size_hint and plan.size_hint > cfg.max_mb * 1048576:
                 raise BiliError(f"视频文件太大（约 {plan.size_hint // 1048576}MB）")
             self.temp_root.mkdir(parents=True, exist_ok=True)
@@ -204,13 +205,35 @@ class Watcher:
                     )
                 except asyncio.TimeoutError as exc:
                     raise BiliError(f"下载视频超过 {cfg.download_timeout:.0f} 秒") from exc
-                self.log.info("B站视频：下载完成（%s），%s 用了 %.0f 秒", info.bvid, _mb(size), time.monotonic() - started)
+                self.last_download = f"{_mb(size)} 用了 {time.monotonic() - started:.0f} 秒"
+                self.log.info("B站视频：下载完成（%s），%s", info.bvid, self.last_download)
                 prompt = build_video_prompt(
                     info.title, info.owner, format_seconds(info.duration), info.description, max(300, cfg.max_chars - 400)
                 )
                 return await self.qwen.describe(video_path, prompt, audio_path)
             finally:
                 shutil.rmtree(workdir, ignore_errors=True)
+
+    async def _choose_plan(self, info: VideoInfo) -> MediaPlan:
+        """带声音的 mp4 太大、只能先传到百炼临时空间时，看看分开的画面和声音能不能都直接放进请求里。
+        真机发现：从日本往北京的临时空间上传极慢（8.5MB 传了 300 秒还没完），直接放进请求里则快得多。"""
+        assert self.qwen is not None
+        plan = await self.bili.media_plan(info, self.settings.quality)
+        limit = self.qwen.inline_limit
+        if plan.audio_url or plan.size_hint <= limit:
+            return plan
+        try:
+            separate = await self.bili.media_plan(info, self.settings.quality, separate=True)
+        except BiliError as exc:
+            self.log.info("B站视频：没拿到分开的画面和声音（%s），照常上传：%s", info.bvid, exc)
+            return plan
+        if separate.audio_url and 0 < separate.size_hint <= limit and separate.audio_size_hint <= limit:
+            self.log.info(
+                "B站视频：合并的视频约 %s，要传到临时空间；改用分开的画面（约 %s）和声音（约 %s），直接发给模型",
+                _mb(plan.size_hint), _mb(separate.size_hint), _mb(separate.audio_size_hint),
+            )
+            return separate
+        return plan
 
     async def _download_all(self, video_url: str, audio_url: str, video: Path, audio: Optional[Path], referer: str) -> int:
         budget = self.settings.max_mb * 1048576

@@ -107,7 +107,8 @@ class MediaPlan:
 
     video_url: str
     audio_url: str = ""
-    size_hint: int = 0  # 字节，B 站给的估计值，可能为 0
+    size_hint: int = 0  # 画面文件的字节数，B 站给的或按码率估的，可能为 0
+    audio_size_hint: int = 0
 
 
 def parse_cookie(raw: str) -> Dict[str, str]:
@@ -398,17 +399,17 @@ class BiliClient:
 
     # ── 播放地址 ──────────────────────────────────
 
-    async def media_plan(self, info: VideoInfo, quality: int) -> MediaPlan:
-        """优先要一个带声音的 mp4（不用 ffmpeg 合并），没有再用分开的画面和声音。
+    async def media_plan(self, info: VideoInfo, quality: int, *, separate: bool = False) -> MediaPlan:
+        """优先要一个带声音的 mp4（不用 ffmpeg 合并），没有再用分开的画面和声音；separate=True 时反过来。
         播放地址接口被风控拦下时，改从视频网页里读（网页里也带着播放地址）。"""
         try:
             base = {"bvid": info.bvid, "cid": info.cid, "qn": quality, "fnver": 0, "fourk": 0, **_fingerprint_params()}
             key = await self._wbi_key()
-            for fnval in (1, 4048):
+            for fnval in (4048, 1) if separate else (1, 4048):
                 data = self._data(
                     await self._json(f"{self.API}/x/player/wbi/playurl", sign_wbi({**base, "fnval": fnval}, key), referer=info.url)
                 )
-                plan = _plan_from_play(data, quality)
+                plan = _plan_from_play(data, quality, separate=separate, duration=info.duration)
                 if plan is not None:
                     return plan
         except BiliError as exc:
@@ -420,7 +421,7 @@ class BiliClient:
                 exc.detail += f"；网页后备也失败：{page_exc.detail or page_exc}"
                 raise exc from page_exc
             data = play.get("data") if isinstance(play.get("data"), dict) else {}
-            plan = _plan_from_play(data, quality)
+            plan = _plan_from_play(data, quality, separate=separate, duration=info.duration)
             if plan is None:
                 exc.detail += "；网页里没有可用的播放地址"
                 raise exc
@@ -534,10 +535,15 @@ def _first_url(item: Dict[str, Any]) -> str:
     return str(backups[0]) if isinstance(backups, list) and backups else ""
 
 
-def _plan_from_play(data: Dict[str, Any], quality: int) -> Optional[MediaPlan]:
+def _plan_from_play(data: Dict[str, Any], quality: int, *, separate: bool = False, duration: int = 0) -> Optional[MediaPlan]:
     durl = [d for d in data.get("durl") or [] if isinstance(d, dict) and _first_url(d)]
-    if len(durl) == 1:
-        return MediaPlan(video_url=_first_url(durl[0]), size_hint=int(durl[0].get("size") or 0))
+    combined = MediaPlan(video_url=_first_url(durl[0]), size_hint=int(durl[0].get("size") or 0)) if len(durl) == 1 else None
+    if combined is not None and not separate:
+        return combined
+    return _dash_plan(data, quality, duration) or combined
+
+
+def _dash_plan(data: Dict[str, Any], quality: int, duration: int) -> Optional[MediaPlan]:
     dash = data.get("dash") if isinstance(data.get("dash"), dict) else {}
     videos = [v for v in dash.get("video") or [] if isinstance(v, dict) and _first_url(v)]
     audios = [a for a in dash.get("audio") or [] if isinstance(a, dict) and _first_url(a)]
@@ -549,7 +555,14 @@ def _plan_from_play(data: Dict[str, Any], quality: int) -> Optional[MediaPlan]:
     same = [v for v in eligible if int(v.get("id") or 0) == best_id]
     video = min(same, key=lambda v: (0 if int(v.get("codecid") or 0) == 7 else 1, int(v.get("bandwidth") or 0)))
     audio = min(audios, key=lambda a: int(a.get("bandwidth") or 0))
-    return MediaPlan(video_url=_first_url(video), audio_url=_first_url(audio))
+    # 分开的文件 B 站不给大小，按码率（每秒比特数）乘时长估
+    seconds = int(dash.get("duration") or duration or 0)
+    return MediaPlan(
+        video_url=_first_url(video),
+        audio_url=_first_url(audio),
+        size_hint=int(video.get("bandwidth") or 0) * seconds // 8,
+        audio_size_hint=int(audio.get("bandwidth") or 0) * seconds // 8,
+    )
 
 
 def _embedded_json(pattern: "re.Pattern[str]", html: str) -> Dict[str, Any]:

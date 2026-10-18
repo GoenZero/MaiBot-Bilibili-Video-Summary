@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
 from urllib.parse import urlparse
 
 import asyncio
@@ -74,6 +74,13 @@ class QwenClient:
         self._session = session
         self.settings = settings
         self.log = logger or logging.getLogger(__name__)
+        self._upload_body: Optional[OssFormPayload] = None
+        self.last_upload = ""  # 最近一次上传的情况，给 /bili_status 看（日志会滚走）
+
+    @property
+    def inline_limit(self) -> int:
+        """多大以内的文件可以直接放进请求里（不用先传到临时空间）。"""
+        return (DATA_URL_LIMIT - 64) * 3 // 4
 
     async def describe(self, video: Path, prompt: str, audio: Optional[Path] = None) -> str:
         cfg = self.settings
@@ -83,10 +90,7 @@ class QwenClient:
             # 画面和声音（如果分开）一起算在同一个上传时限里
             content, uses_oss = await asyncio.wait_for(self._prepare_all(video, audio), cfg.upload_timeout)
         except asyncio.TimeoutError as exc:
-            total = video.stat().st_size + (audio.stat().st_size if audio is not None else 0)
-            raise QwenError(
-                f"上传视频到百炼超过 {cfg.upload_timeout:.0f} 秒（视频约 {_mb(total)}，网络上传太慢）"
-            ) from exc
+            raise QwenError(f"上传视频到百炼超过 {cfg.upload_timeout:.0f} 秒（{self._upload_progress(video, audio)}）") from exc
         content.append({"type": "text", "text": prompt})
         payload = {
             "model": cfg.model,
@@ -101,8 +105,22 @@ class QwenClient:
         except asyncio.TimeoutError as exc:
             raise QwenError(f"百炼看视频超过 {cfg.model_timeout:.0f} 秒") from exc
 
+    def _upload_progress(self, video: Path, audio: Optional[Path]) -> str:
+        """上传超时时说明传到哪了：只传了一部分是网络慢；全传完了还没回音是阿里云那边没响应。"""
+        body = self._upload_body
+        if body is None:
+            total = video.stat().st_size + (audio.stat().st_size if audio is not None else 0)
+            note = f"视频约 {_mb(total)}，还没开始传文件"
+        elif body.sent >= body.size:
+            note = f"{_mb(body.size)} 已经全部传出，但阿里云一直没回应"
+        else:
+            note = f"{_mb(body.size)} 只传出了 {_mb(body.sent)}，网络上传太慢"
+        self.last_upload = f"超时：{note}"
+        return note
+
     async def _prepare_all(self, video: Path, audio: Optional[Path]) -> tuple[List[Dict[str, Any]], bool]:
         cfg = self.settings
+        self._upload_body = None
         video_ref, uses_oss = await self._prepare(video, "video/mp4")
         content: List[Dict[str, Any]] = [
             {"type": "video_url", "video_url": {"url": video_ref}, "fps": cfg.fps, "max_pixels": cfg.max_pixels}
@@ -157,7 +175,7 @@ class QwenClient:
         self.log.info("B站视频：开始把 %s 传到百炼临时空间", _mb(size))
         started = time.monotonic()
         try:
-            body = OssFormPayload(path, fields=fields, content_type=mime)
+            body = self._upload_body = OssFormPayload(path, fields=fields, content_type=mime)
             timeout = aiohttp.ClientTimeout(total=None, sock_connect=20, sock_read=cfg.upload_timeout)
             async with self._session.post(upload_host, data=body, timeout=timeout) as response:
                 if response.status != 200:
@@ -168,7 +186,8 @@ class QwenClient:
         except aiohttp.ClientError as exc:
             raise QwenError(f"上传视频到百炼失败（{type(exc).__name__}）") from exc
         elapsed = max(time.monotonic() - started, 0.001)
-        self.log.info("B站视频：上传完成，%s 用了 %.0f 秒（约 %s/秒）", _mb(size), elapsed, _mb(size / elapsed))
+        self.last_upload = f"{_mb(size)} 用了 {elapsed:.0f} 秒（约 {_mb(size / elapsed)}/秒）"
+        self.log.info("B站视频：上传完成，%s", self.last_upload)
         return f"oss://{key}"
 
     async def _stream(self, payload: Dict[str, Any], uses_oss: bool) -> str:
@@ -242,6 +261,7 @@ class OssFormPayload(aiohttp.payload.Payload):
             f"Content-Type: {content_type}\r\n\r\n".encode()
         )
         self._head = b"".join(parts)
+        self.sent = 0  # 已经交给网络发出的字节数，超时时用来判断是慢还是卡住
         self._tail = f"\r\n--{boundary}--\r\n".encode()
         super().__init__(None, content_type=f"multipart/form-data; boundary={boundary}")
         self._size = len(self._head) + path.stat().st_size + len(self._tail)
@@ -250,11 +270,16 @@ class OssFormPayload(aiohttp.payload.Payload):
         raise TypeError("上传表单不能当文字读")
 
     async def write(self, writer: Any) -> None:
-        await writer.write(self._head)
+        for piece in self._pieces():
+            await writer.write(piece)
+            self.sent += len(piece)
+
+    def _pieces(self) -> Iterator[bytes]:
+        yield self._head
         with self._path.open("rb") as handle:
-            while chunk := handle.read(1024 * 1024):
-                await writer.write(chunk)
-        await writer.write(self._tail)
+            while chunk := handle.read(256 * 1024):
+                yield chunk
+        yield self._tail
 
 
 def _mb(size: float) -> str:
