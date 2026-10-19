@@ -50,3 +50,4 @@ python -m pytest tests          # 本地假的 B 站、百炼、Gemini 服务器
   - 2026-10-19 真机事故：Photon 断线 8 秒恢复后，用户约 30 秒后发的两条消息 Photon 上有却没推送过来（`/imessage_missed` 证实）。自动补收就是为此加的，还没在真机上见它补收过。
 - `GoenZero/MaiBot-Proactive-Chat`：让大肥鱼主动找用户聊天的插件，开发在 `develop` 分支，同样等用户确认后合并。
 - 打版本标签（tag）要用户自己在 GitHub 网页上建。
+- MaiBot 1.3.10（2026-10-19 对照源码检查过）：B 站和主动聊天插件用到的接口都没变，不用改；适配器因为 reply 工具去掉了 `set_quote`，改了给 AI 的引用提示（0.2.2）。
