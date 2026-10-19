@@ -46,6 +46,7 @@ python -m pytest tests          # 本地假的 B 站、百炼、Gemini 服务器
 
 ## 同一个用户的另外两个仓库
 
-- `GoenZero/MaiBot-iMessage-Adapter`：iMessage 适配器。0.2.1（适配 MaiBot 1.3.9 的 account_id、启动时等网关就绪、命令回复不存进聊天记录）在功能分支上，用户测试满意后再合并到 `main`。
+- `GoenZero/MaiBot-iMessage-Adapter`：iMessage 适配器。功能分支 `feature/photon-capabilities` 上是 0.2.2（0.2.1：适配 MaiBot 1.3.9 的 account_id、启动时等网关就绪、命令回复不存进聊天记录；0.2.2：`/imessage_missed` 对照 Photon 消息记录排查漏消息、漏消息自动补收）。用户测试满意后再合并到 `main`。
+  - 2026-10-19 真机事故：Photon 断线 8 秒恢复后，用户约 30 秒后发的两条消息 Photon 上有却没推送过来（`/imessage_missed` 证实）。自动补收就是为此加的，还没在真机上见它补收过。
 - `GoenZero/MaiBot-Proactive-Chat`：让大肥鱼主动找用户聊天的插件，开发在 `develop` 分支，同样等用户确认后合并。
 - 打版本标签（tag）要用户自己在 GitHub 网页上建。
