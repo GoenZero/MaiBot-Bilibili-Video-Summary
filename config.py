@@ -1,4 +1,4 @@
-"""B 站视频插件配置（WebUI 配置页由此自动生成）。"""
+"""B 站插件配置（WebUI 配置页由此自动生成）。"""
 
 from __future__ import annotations
 
@@ -7,8 +7,8 @@ from typing import ClassVar, Literal
 from maibot_sdk import Field, PluginConfigBase
 
 # 配置结构有增减时提升版本：MaiBot 只在版本升高时把新字段写回已有的 config.toml
-SUPPORTED_CONFIG_VERSION = "1.1.0"
-PLUGIN_VERSION = "0.1.0"
+SUPPORTED_CONFIG_VERSION = "1.2.0"
+PLUGIN_VERSION = "0.2.0"
 
 
 class PluginOptions(PluginConfigBase):
@@ -29,7 +29,7 @@ class BilibiliConfig(PluginConfigBase):
 
     cookie: str = Field(
         default="",
-        description="B 站登录 Cookie。只有读 AI 字幕需要它；不填也能看短视频。建议用小号。",
+        description="B 站登录 Cookie（旧办法）。现在推荐在和她的私聊里发 /bili_login 扫码登录她自己的账号；扫过码就不用填这里。",
         json_schema_extra={
             "label": "登录 Cookie",
             "input_type": "password",
@@ -162,9 +162,48 @@ class WatchConfig(PluginConfigBase):
     )
 
 
+class AccountConfig(PluginConfigBase):
+    __ui_label__: ClassVar[str] = "她的账号"
+    __ui_order__: ClassVar[int] = 5
+
+    like: bool = Field(default=True, description="允许她给喜欢的视频点赞。", json_schema_extra={"label": "点赞", "order": 0})
+    coin: bool = Field(default=True, description="允许她投币（用她自己账号的硬币）。", json_schema_extra={"label": "投币", "order": 1})
+    favorite: bool = Field(default=True, description="允许她收藏到自己的默认收藏夹。", json_schema_extra={"label": "收藏", "order": 2})
+    later: bool = Field(default=True, description="允许她加「稍后再看」。", json_schema_extra={"label": "稍后再看", "order": 3})
+    follow: bool = Field(default=True, description="允许她关注喜欢的 UP 主（对首页推荐影响很大）。", json_schema_extra={"label": "关注 UP 主", "order": 4})
+    history: bool = Field(
+        default=True,
+        description="她看完视频后给账号留下观看记录，首页推荐会慢慢变成她的口味。",
+        json_schema_extra={"label": "留下观看记录", "order": 5},
+    )
+    requests_per_day: int = Field(
+        default=600, ge=50, le=5000, description="她的账号每天最多发多少个请求（逛、看评论、各种操作合计）。", json_schema_extra={"label": "每天请求上限", "order": 6}
+    )
+    likes_per_day: int = Field(default=30, ge=0, le=200, description="每天最多点赞几次。", json_schema_extra={"label": "每天点赞上限", "order": 7})
+    coins_per_day: int = Field(default=2, ge=0, le=10, description="每天最多投几个币。", json_schema_extra={"label": "每天投币上限", "order": 8})
+    favorites_per_day: int = Field(default=15, ge=0, le=100, description="每天最多收藏几个。", json_schema_extra={"label": "每天收藏上限", "order": 9})
+    follows_per_day: int = Field(default=5, ge=0, le=50, description="每天最多关注几个 UP 主。", json_schema_extra={"label": "每天关注上限", "order": 10})
+
+
+class BrowseConfig(PluginConfigBase):
+    __ui_label__: ClassVar[str] = "逛 B 站"
+    __ui_order__: ClassVar[int] = 6
+
+    list_count: int = Field(default=12, ge=5, le=30, description="首页推荐、热门、搜索一次给她看几条。", json_schema_extra={"label": "每次几条", "order": 0})
+    max_minutes: int = Field(default=40, ge=1, le=600, description="比这更长的视频不出现在推荐和热门里（搜索不限）。", json_schema_extra={"label": "视频时长上限（分钟）", "order": 1})
+    comment_count: int = Field(default=12, ge=3, le=30, description="看评论区一次看几条（每条最多带两条回复）。", json_schema_extra={"label": "每次几条评论", "order": 2})
+    comment_images: int = Field(
+        default=3, ge=0, le=6, description="评论区一次最多让她看几张图（看到喜欢的可以收藏成表情包）。0 表示不看图。", json_schema_extra={"label": "每次几张评论图", "order": 3}
+    )
+    blocked_keywords: list[str] = Field(default_factory=list, description="标题里带这些词的视频不出现在推荐和热门里。", json_schema_extra={"label": "屏蔽关键词", "order": 4})
+    blocked_ups: list[str] = Field(default_factory=list, description="这些 UP 主的视频不出现在推荐、热门和搜索里。", json_schema_extra={"label": "屏蔽 UP 主", "order": 5})
+
+
 class BilibiliVideoConfig(PluginConfigBase):
     plugin: PluginOptions = Field(default_factory=PluginOptions)
     bilibili: BilibiliConfig = Field(default_factory=BilibiliConfig)
     qwen: QwenConfig = Field(default_factory=QwenConfig)
     gemini: GeminiConfig = Field(default_factory=GeminiConfig)
     watch: WatchConfig = Field(default_factory=WatchConfig)
+    account: AccountConfig = Field(default_factory=AccountConfig)
+    browse: BrowseConfig = Field(default_factory=BrowseConfig)

@@ -142,7 +142,7 @@ class FakeWorld:
                     "title": "猫猫跳桌子",
                     "desc": "我家猫今天又整活了",
                     "tname": "动物圈",
-                    "owner": {"name": "养猫的人"},
+                    "owner": {"name": "养猫的人", "mid": 9},
                     "duration": self.duration + 30,
                     "pages": pages,
                 },
@@ -210,7 +210,7 @@ class FakeWorld:
             "title": "猫猫跳桌子",
             "desc": "我家猫今天又整活了",
             "tname": "动物圈",
-            "owner": {"name": "养猫的人"},
+            "owner": {"name": "养猫的人", "mid": 9},
             "duration": self.duration,
             "pages": [{"cid": 170002, "part": "正片", "duration": self.duration}],
         }

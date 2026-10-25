@@ -52,10 +52,11 @@ class BiliError(Exception):
     """给人和 AI 看的错误说明；detail 只写进日志（哪个接口、什么状态），帮助排查。
     blocked 表示是被风控拦下的（可以换条路再试）。"""
 
-    def __init__(self, message: str, detail: str = "", *, blocked: bool = False) -> None:
+    def __init__(self, message: str, detail: str = "", *, blocked: bool = False, status: int = 0) -> None:
         super().__init__(message)
         self.detail = detail
         self.blocked = blocked
+        self.status = status
 
 
 # 被 B 站风控（HTTP 412）拦下后，这个接口地址暂停一段时间，不再接连请求，免得越拦越久；网页那条路不受影响
@@ -79,6 +80,7 @@ class VideoInfo:
     description: str = ""
     category: str = ""
     page_count: int = 1
+    owner_mid: int = 0
 
     @property
     def url(self) -> str:
@@ -205,10 +207,14 @@ class BiliClient:
 
     WWW = "https://www.bilibili.com"
 
-    def __init__(self, session: aiohttp.ClientSession, cookie: str = "", logger: Optional[logging.Logger] = None) -> None:
+    def __init__(
+        self, session: aiohttp.ClientSession, cookie: str = "", logger: Optional[logging.Logger] = None, guard: Optional[Any] = None
+    ) -> None:
         self._session = session
         self.log = logger or logging.getLogger(__name__)
         self._cookies = parse_cookie(cookie)
+        # 带着她自己账号的登录信息时，请求也要过账号守卫（暂停、配额、间隔），被拦就暂停账号
+        self.guard = guard
         # 没有设备标识（buvid3）的请求更容易被风控；用户粘的 Cookie 里一般有，没有就向 B 站要一个
         self._device_ready = "buvid3" in self._cookies
         self._device_lock = asyncio.Lock()
@@ -264,9 +270,9 @@ class BiliClient:
         try:
             async with self._session.get(url, params=params, headers=headers, timeout=aiohttp.ClientTimeout(total=timeout)) as response:
                 if response.status == 412:
-                    raise BiliError(_ERRORS[-412], f"{where} HTTP 412", blocked=True)
+                    raise BiliError(_ERRORS[-412], f"{where} HTTP 412", blocked=True, status=412)
                 if response.status >= 400:
-                    raise BiliError(f"B 站返回 HTTP {response.status}", f"{where} HTTP {response.status}")
+                    raise BiliError(f"B 站返回 HTTP {response.status}", f"{where} HTTP {response.status}", status=response.status)
                 if text:
                     return await response.text(errors="replace")
                 return await response.json(content_type=None)
@@ -284,9 +290,24 @@ class BiliClient:
         if remaining > 0:
             raise BiliError(f"刚被 B 站风控拦过，{remaining} 秒后再试", f"{where} 暂停中", blocked=True)
         await self._ensure_device()
+        trusted = url.startswith(self.API) or url.startswith(self.WWW)
+        guarded = self.guard is not None and self.has_login_cookie and trusted
+        if guarded:
+            try:
+                wait = self.guard.before_request()
+                if wait > 0:
+                    await asyncio.sleep(wait)
+                if self.guard.paused:
+                    raise RuntimeError(self.guard.paused)
+            except Exception as exc:  # 暂停中、配额用完：这次不带登录信息
+                self.log.info("B站视频：她的账号暂停或用完配额（%s），这次不带登录信息", exc)
+                guarded = False
         try:
-            payload = await self._get(url, params, self._headers(referer), timeout, text=False)
+            anonymous = not trusted or (self.guard is not None and not guarded)
+            payload = await self._get(url, params, self._headers(referer, anonymous=anonymous), timeout, text=False)
         except BiliError as exc:
+            if guarded and (reason := self.guard.pause_reason_for(http_status=exc.status)):
+                self.guard.pause(reason)
             if not (exc.blocked and self.has_login_cookie):
                 if exc.blocked:
                     self._blocked_until[where] = time.monotonic() + BLOCK_COOLDOWN
@@ -301,13 +322,17 @@ class BiliClient:
             self.log.info("B站视频：%s 带登录信息被风控拦下，不带登录信息成功了", where)
         if not isinstance(payload, dict):
             raise BiliError("B 站返回的内容看不懂", f"{where} 不是 JSON 对象")
+        code = payload.get("code")
+        if guarded and isinstance(code, int) and (reason := self.guard.pause_reason_for(code=code)):
+            self.guard.pause(reason)  # 带着她的登录信息却显示没登录、被风控或太频繁
         if payload.get("code") in (-352, -412):
             self._blocked_until[where] = time.monotonic() + BLOCK_COOLDOWN
         return payload
 
     async def _page(self, url: str) -> str:
         """打开视频网页（接口被风控时的后备，网页和接口不是同一个入口）。"""
-        html = await self._get(url, None, self._headers(url, html=True), 15, text=True)
+        # 网页后备不过账号守卫，用她的账号时不带登录信息
+        html = await self._get(url, None, self._headers(url, anonymous=self.guard is not None, html=True), 15, text=True)
         return str(html)[:5_000_000]
 
     @staticmethod
@@ -470,7 +495,7 @@ class BiliClient:
         """出现次数最多的几条弹幕。"""
         try:
             async with self._session.get(
-                f"{self.COMMENT}/{cid}.xml", headers=self._headers(), timeout=aiohttp.ClientTimeout(total=10)
+                f"{self.COMMENT}/{cid}.xml", headers=self._headers(anonymous=self.guard is not None), timeout=aiohttp.ClientTimeout(total=10)
             ) as response:
                 if response.status >= 400:
                     return []
@@ -491,7 +516,8 @@ class BiliClient:
         """边下边写文件，超过 max_bytes 立即停下并删掉。返回字节数。超时由调用方控制。"""
         size = 0
         try:
-            async with self._session.get(url, headers=self._headers(referer)) as response:
+            # 弹幕和视频文件不需要登录：用她的账号时不带登录信息，免得这些请求绕过账号守卫
+            async with self._session.get(url, headers=self._headers(referer, anonymous=self.guard is not None)) as response:
                 if response.status >= 400:
                     raise BiliError(f"下载视频失败：HTTP {response.status}")
                 if response.content_length and response.content_length > max_bytes:
@@ -597,4 +623,5 @@ def _info_from_view(data: Dict[str, Any], ref: VideoRef) -> VideoInfo:
         description=str(data.get("desc") or "").strip(),
         category=str(data.get("tname") or ""),
         page_count=max(len(pages), 1),
+        owner_mid=int(owner.get("mid") or 0),
     )

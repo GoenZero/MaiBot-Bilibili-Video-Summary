@@ -1,9 +1,9 @@
 {
   "manifest_version": 2,
   "id": "com.goenzero.bilibili_video",
-  "version": "0.1.0",
-  "name": "B站视频 / Bilibili Video",
-  "description": "让 AI 能看 B 站视频：短视频交给阿里百炼千问 Omni 或 Google Gemini 看画面和声音，长视频读字幕，并附上标题、简介和热门弹幕。",
+  "version": "0.2.0",
+  "name": "B站 / Bilibili",
+  "description": "让 AI 能看 B 站视频（短视频看画面和声音，长视频读字幕），也能扫码登录她自己的账号逛首页推荐、热门、搜索，看评论区（带图），点赞、投币、收藏、稍后再看、关注，看完留观看记录，把喜欢的评论图收藏成表情包。只看不评论；被风控就暂停等主人处理。",
   "author": {
     "name": "GoenZero",
     "url": "https://github.com/GoenZero"
@@ -27,6 +27,11 @@
       "type": "python_package",
       "name": "aiohttp",
       "version_spec": ">=3.9"
+    },
+    {
+      "type": "python_package",
+      "name": "qrcode",
+      "version_spec": ">=7.4"
     }
   ],
   "plugin_type": "extension",
@@ -37,7 +42,9 @@
     }
   },
   "capabilities": [
+    "emoji.register",
     "llm.generate",
+    "send.image",
     "send.text"
   ],
   "i18n": {
