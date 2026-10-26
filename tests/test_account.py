@@ -344,3 +344,25 @@ def test_watch_path_with_her_login_is_guarded(tmp_path, monkeypatch):
         await plugin.on_unload()
 
     with_account_world(monkeypatch, test)
+
+
+def test_forbidden_features_are_not_retried_until_owner_resumes(tmp_path, monkeypatch):
+    host = FakeHost()
+    plugin = make_plugin(tmp_path, host, copy.deepcopy(ACCOUNT_CONFIG))
+
+    async def test(world):
+        await plugin.on_load()
+        await login(plugin, host, world)
+        world.reply_code = -403
+        first = await plugin.tool_comments(video=BVID)
+        assert first["success"] is False and "不让你的账号看评论区" in first["error"]
+        world.reply_code = 0
+        again = await plugin.tool_comments(video=BVID)  # 不再去碰 B 站
+        assert again["success"] is False and "先别用了" in again["error"]
+        assert "🚫 B 站不让她的账号看评论区" in await plugin.status_text()
+        assert (await plugin.tool_browse(source="热门"))["success"]  # 别的功能照常
+        await plugin.handle_resume(stream_id="s1")
+        assert (await plugin.tool_comments(video=BVID))["success"]
+        await plugin.on_unload()
+
+    with_account_world(monkeypatch, test)

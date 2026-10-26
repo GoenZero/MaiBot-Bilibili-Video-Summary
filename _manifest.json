@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "id": "com.goenzero.bilibili_video",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "name": "B站 / Bilibili",
   "description": "让 AI 能看 B 站视频（短视频看画面和声音，长视频读字幕），也能扫码登录她自己的账号逛首页推荐、热门、搜索，看评论区（带图），点赞、投币、收藏、稍后再看、关注，看完留观看记录，把喜欢的评论图收藏成表情包。只看不评论；被风控就暂停等主人处理。",
   "author": {

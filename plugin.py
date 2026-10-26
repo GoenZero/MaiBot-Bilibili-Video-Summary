@@ -23,7 +23,7 @@ from maibot_sdk import Command, HookHandler, MaiBotPlugin, Tool
 from maibot_sdk.types import ErrorPolicy, HookMode, ToolParameterInfo, ToolParamType
 
 from .config import PLUGIN_VERSION, BilibiliVideoConfig
-from .core.account import ACTION_NAMES, QR_DONE, QR_EXPIRED, QR_SCANNED, Account, AccountPaused, Limits, QuotaExceeded, qr_png_base64
+from .core.account import ACTION_NAMES, FEATURES, QR_DONE, QR_EXPIRED, QR_SCANNED, Account, AccountPaused, Limits, QuotaExceeded, qr_png_base64
 from .core.bilibili import BiliClient, BiliError, parse_time
 from .core.browse import Browser, Comment, VideoCard
 from .core.cache import ResultCache
@@ -407,6 +407,8 @@ class BilibiliVideoPlugin(MaiBotPlugin):
         if error := self._usable():
             return {"success": False, "error": error}
         assert self._browser is not None
+        if reason := self._browser.account.blocked("comments"):
+            return {"success": False, "error": f"B 站现在不让你的账号看评论区（{reason}），先别用了"}
         try:
             info = await self._video(video)
             comments = await self._browser.comments(info.aid, info.bvid, newest=str(sort or "").strip() == "最新", count=self.config.browse.comment_count)
@@ -414,6 +416,9 @@ class BilibiliVideoPlugin(MaiBotPlugin):
             return {"success": False, "error": str(exc)}
         except BiliError as exc:
             self.ctx.logger.warning("B站：看评论区失败：%s %s", exc, exc.detail)
+            if exc.code == -403:
+                self._block("comments", str(exc))
+                return {"success": False, "error": f"B 站不让你的账号看评论区（{exc}），先别用了"}
             return {"success": False, "error": f"评论区没打开：{exc}"}
         if not comments:
             return {"success": True, "content": f"《{info.title}》的评论区还没人说话。"}
@@ -477,6 +482,8 @@ class BilibiliVideoPlugin(MaiBotPlugin):
             return {"success": False, "error": f"{ACTION_NAMES[key]}没开放"}
         if not self._browser.account.logged_in:
             return {"success": False, "error": "还没登录你自己的 B 站账号"}
+        if reason := self._browser.account.blocked("actions"):
+            return {"success": False, "error": f"B 站现在不让你的账号点赞、投币、收藏这些（{reason}），先别用了"}
         try:
             info = await self._video(video)
             target = str(info.bvid) if key != "follow" else ""
@@ -488,6 +495,9 @@ class BilibiliVideoPlugin(MaiBotPlugin):
             return {"success": False, "error": str(exc)}
         except BiliError as exc:
             self.ctx.logger.warning("B站：%s失败：%s %s", ACTION_NAMES[key], exc, exc.detail)
+            if exc.code == -403:
+                self._block("actions", str(exc))
+                return {"success": False, "error": f"B 站不让你的账号做这些操作（{exc}），先别用了"}
             return {"success": False, "error": f"{ACTION_NAMES[key]}没成功：{exc}"}
         self.ctx.logger.info("B站：她%s了 %s", ACTION_NAMES[key], info.bvid)
         what = f"UP 主「{info.owner}」" if key == "follow" else f"《{info.title}》"
@@ -511,6 +521,11 @@ class BilibiliVideoPlugin(MaiBotPlugin):
         else:
             await self._browser.follow(int(target), info.bvid)
         account.record_action(key, target)
+
+    def _block(self, feature: str, reason: str) -> None:
+        assert self._browser is not None
+        self._browser.account.block(feature, reason)
+        self.ctx.logger.warning("B站：B 站不让她的账号%s（%s），先停用，主人 /bili_resume 后再试", FEATURES[feature], reason)
 
     async def _owner_mid(self, bvid: str) -> int:
         assert self._browser is not None
@@ -612,7 +627,11 @@ class BilibiliVideoPlugin(MaiBotPlugin):
     async def handle_resume(self, stream_id: str = "", **kwargs: Any) -> tuple:
         del kwargs
         account = self._account
-        if account is None or not account.paused:
+        if account is not None and not account.paused and any(account.blocked(f) for f in FEATURES):
+            account.resume()
+            text = "好，让她再试试评论区和点赞这些。"
+            self.ctx.logger.info("B站：主人让她再试被 B 站拒绝过的功能")
+        elif account is None or not account.paused:
             text = "B 站没有暂停。"
         else:
             reason = account.paused
@@ -652,6 +671,10 @@ class BilibiliVideoPlugin(MaiBotPlugin):
             lines.append("她的账号：未登录（发 /bili_login 扫码）")
         if account is not None and account.paused:
             lines.append(f"⛔ 账号操作已暂停：{account.paused}（确认没问题后发 /bili_resume）")
+        if account is not None:
+            for feature, name in FEATURES.items():
+                if reason := account.blocked(feature):
+                    lines.append(f"🚫 B 站不让她的账号{name}：{reason}（发 /bili_resume 让她再试）")
         if watcher is not None and watcher.bili.has_login_cookie and not (account is not None and account.logged_in):
             try:
                 logged_in, name = await watcher.bili.login_status()

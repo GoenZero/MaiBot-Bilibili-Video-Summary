@@ -52,11 +52,12 @@ class BiliError(Exception):
     """给人和 AI 看的错误说明；detail 只写进日志（哪个接口、什么状态），帮助排查。
     blocked 表示是被风控拦下的（可以换条路再试）。"""
 
-    def __init__(self, message: str, detail: str = "", *, blocked: bool = False, status: int = 0) -> None:
+    def __init__(self, message: str, detail: str = "", *, blocked: bool = False, status: int = 0, code: int = 0) -> None:
         super().__init__(message)
         self.detail = detail
         self.blocked = blocked
         self.status = status
+        self.code = code  # B 站接口返回的错误码（0 表示不是接口错误）
 
 
 # 被 B 站风控（HTTP 412）拦下后，这个接口地址暂停一段时间，不再接连请求，免得越拦越久；网页那条路不受影响

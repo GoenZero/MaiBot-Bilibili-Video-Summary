@@ -30,6 +30,8 @@ PAUSE_CODES = {
     22015: "账号被限制操作",
 }
 ACTIONS = ("like", "coin", "favorite", "later", "follow", "history")
+# B 站不让这个账号用的功能（-403 访问权限不足 / 账号异常）：记下来不再反复尝试，主人 /bili_resume 后才重试
+FEATURES = {"comments": "看评论区", "actions": "点赞、投币、收藏这些操作"}
 ACTION_NAMES = {"like": "点赞", "coin": "投币", "favorite": "收藏", "later": "稍后再看", "follow": "关注 UP 主", "history": "观看记录"}
 
 
@@ -106,12 +108,26 @@ class Account:
             self.on_pause()
 
     def resume(self, *, reason_contains: str = "") -> bool:
+        """解除暂停；主人手动恢复（不带 reason_contains）时也清掉被 B 站拒绝的功能，让她再试一次。"""
+        cleared_features = False
+        if not reason_contains and self._state.get("blocked"):
+            self._state.pop("blocked", None)
+            cleared_features = True
         if not self.paused or (reason_contains and reason_contains not in self.paused):
-            return False
+            if cleared_features:
+                self._save_state()
+            return cleared_features
         self._state.pop("paused_reason", None)
         self._state.pop("paused_at", None)
         self._save_state()
         return True
+
+    def blocked(self, feature: str) -> str:
+        return str((self._state.get("blocked") or {}).get(feature) or "")
+
+    def block(self, feature: str, reason: str) -> None:
+        self._state.setdefault("blocked", {})[feature] = reason
+        self._save_state()
 
     def pause_reason_for(self, *, http_status: int = 0, code: Optional[int] = None) -> str:
         if http_status in PAUSE_HTTP:

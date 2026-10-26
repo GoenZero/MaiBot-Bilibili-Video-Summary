@@ -147,7 +147,7 @@ class Browser:
             if reason:
                 self.account.pause(reason)
                 raise AccountPaused(f"B 站那边暂停了：{reason}。等主人处理后再试")
-            raise BiliError(f"B 站返回错误 {code}：{str(payload.get('message', ''))[:60]}", f"{path} code={code}")
+            raise BiliError(f"B 站返回错误 {code}：{str(payload.get('message', ''))[:60]}", f"{path} code={code}", code=code)
         data = payload.get("data")
         return data if isinstance(data, dict) else {"_value": data}
 
